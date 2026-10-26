@@ -1,0 +1,40 @@
+/* =============================================================================
+ * 全局主题变量 —— 视觉风格对齐 AgentChat：
+ * 浅色为主、品牌蓝 #1b7ce4、正文深色 #263445、圆角 12px。
+ * 后续新页面一律引用这里的变量，禁止写死颜色。
+ * ========================================================================== */
+:root {
+  --ac-brand: #1b7ce4;
+  --ac-brand-hover: #1568c0;
+  --ac-brand-light: #e8f2fd;
+  --ac-text: #263445;
+  --ac-text-secondary: #6b7a8d;
+  --ac-border: #e5e9ef;
+  --ac-bg: #f7f9fb;
+  --ac-surface: #ffffff;
+  --ac-radius: 12px;
+  /* 会话状态点的中性（空闲/机器人）色，供 ChatView 等复用，避免页面写死十六进制 */
+  --ac-dot-idle: #b9c6d3;
+
+  /* Element Plus 主色覆盖 */
+  --el-color-primary: var(--ac-brand);
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  color: var(--ac-text);
+  background: var(--ac-bg);
+}
+
+/* Markdown 渲染的助手消息基础排版 */
+.md-body { line-height: 1.7; word-break: break-word; }
+.md-body p { margin: 4px 0; }
+.md-body pre {
+  background: #f2f4f7; padding: 10px 12px; border-radius: 8px; overflow-x: auto;
+}
+.md-body code { background: #f2f4f7; padding: 1px 5px; border-radius: 4px; }
+.md-body pre code { background: none; padding: 0; }
+.md-body table { border-collapse: collapse; }
+.md-body th, .md-body td { border: 1px solid var(--ac-border); padding: 4px 10px; }

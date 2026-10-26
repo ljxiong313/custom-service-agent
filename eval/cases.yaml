@@ -1,0 +1,36 @@
+# 评测用例（P6）：检索质量为主，对话质量为可选（需有效模型 api_key）
+#
+# type:
+#   retrieval  POST /knowledge/search，期望结果命中 expect_file（BM25 降级模式也可跑）
+#   product    GET /knowledge/products?q=，期望结构化商品精确命中
+#   chat       SSE /chat/completions，断言回答关键词 —— 模型未配置时自动 SKIP
+retrieval:
+  - id: r1
+    query: 洁面乳 敏感肌
+    expect_file: demo_products.xlsx
+  - id: r2
+    query: 面霜 保湿 国货
+    expect_file: demo_products.xlsx
+  - id: r3
+    query: 退货 政策 无理由
+    expect_file: demo_policy.txt
+  - id: r4
+    query: 包邮 门槛 会员折扣
+    expect_file: demo_policy.txt
+product:
+  - id: p1
+    q: SKU001
+    expect_name: 清爽保湿面霜50g
+  - id: p2
+    q: 精华
+    expect_name: 烟酰胺精华原液
+chat:
+  - id: c1
+    message: 你们的面霜多少钱？
+    expect_any: ["129"]
+  - id: c2
+    message: 氨基酸洁面适合敏感肌吗？
+    expect_any: ["敏感"]
+  - id: c3
+    message: 我要转人工
+    expect_any: ["人工客服"]

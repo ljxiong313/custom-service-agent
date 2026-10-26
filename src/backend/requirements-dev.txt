@@ -1,0 +1,6 @@
+# 开发/测试工具（不进生产镜像）：先装 requirements.txt 再装这个，或用 -r 直接带上全部运行依赖。
+-r requirements.txt
+
+pytest>=8.0,<10.0        # 离线单测在 tests/（py -m pytest tests -q）
+ruff>=0.6,<1.0           # lint + import 排序（ruff check . / ruff format --check .）
+mypy>=1.11,<3.0          # 类型检查（py -m mypy）

@@ -1,0 +1,22 @@
+# 构建上下文是仓库根目录：只让镜像拿到后端源码，其余一概不进层。
+# 关键是 config.local.yaml（明文 api_key）和 data/（数据库 + 备份快照）不能进镜像。
+**/__pycache__/
+*.pyc
+.git/
+.gitignore
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+src/backend/config.local.yaml
+src/backend/data/
+src/backend/uvicorn_dev.log
+
+src/frontend/
+docs/
+eval/
+pyproject.toml
+README.md
+Dockerfile
+.dockerignore
+docker-compose.yml

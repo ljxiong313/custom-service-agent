@@ -1,0 +1,50 @@
+# Python 工具链统一配置：pytest / ruff / mypy 都从这里读。
+# 放在仓库根，是为了让 src/backend 与 eval 两处 Python 代码共用同一套规则
+# （前端 src/frontend 由自己的 package.json / tsconfig 管，不在此文件范围内）。
+# 命令（都在仓库根执行）：
+#   py -m pytest                        # 离线单测，不需要服务、不联网
+#   py -m ruff check .                  # lint（不做 ruff format：全仓库格式化会产生 64 个文件的
+#                                       # 无意义 diff，中文注释/手工对齐反而会被打散）
+#   py -m mypy
+
+[tool.pytest.ini_options]
+# 必须限定收集范围：默认收集会把 scripts/smoke_test.py 当测试文件导入，
+# 而它在模块末尾 sys.exit()，pytest 直接 INTERNALERROR 退出。
+testpaths = ["src/backend/tests"]
+# 让 app 包在任何 cwd 下都能 import（pytest 不会把项目根塞进 sys.path）
+pythonpath = ["src/backend"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+# 让 isort 把 app.* 认作第一方，排在第三方之后（否则按字母序插进 pytest/sqlmodel 中间）
+src = ["src/backend"]
+
+[tool.ruff.lint]
+# 选的是"能长期守住且不靠重写风格"的几族：
+# E/W 基础风格、F 未定义/未使用（真 bug 高发区）、I import 排序、
+# B bugbear（常见运行时陷阱）、UP pyupgrade、C4/SIM 集合与简化。
+# 刻意没选 ANN（全仓库补注解噪音太大）、D（文档字符串规则与中文注释风格冲突）、
+# S（assert/临时目录在测试里是正当用法）。
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI 的依赖/表单声明就是写在参数默认值上的，B008 对它属于误报。
+extend-immutable-calls = ["fastapi.File", "fastapi.Form", "fastapi.Query",
+                          "fastapi.Body", "fastapi.Depends"]
+
+[tool.ruff.lint.per-file-ignores]
+# conftest 的测试配置是"一个平台一行"的内联 YAML，拆行反而看不出结构差异。
+"src/backend/tests/conftest.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/backend/app", "eval"]
+# 失效的 type: ignore 也要报错：修好一处类型问题却留着旧的 ignore 注释，等于悄悄关掉检查
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# 这些三方库没有 py.typed/stub，按"存在但未知"处理：不让它们把真正的错误淹没在 import 噪音里。
+module = ["yaml", "jieba", "rank_bm25", "openpyxl", "openpyxl.*", "docx", "pypdf",
+          "chromadb", "chromadb.*", "rank_bm25.*"]
+ignore_missing_imports = true

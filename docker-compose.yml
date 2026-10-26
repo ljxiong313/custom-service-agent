@@ -1,0 +1,24 @@
+# 后端单容器部署。**不要 scale 副本**：进程内状态（sweeper、MCP 确认表）要求单进程。
+#
+# 本机没有 docker，这份文件未经 `docker compose up` 验证；第一次起来请先核对
+# GET http://127.0.0.1:7861/health 和日志里的"配置加载完成"路径。
+#
+# 前端不在这里：`cd src/frontend && npm run build`，把 dist 交给任意静态托管，
+# 由它把 /api 反代到本服务的 7861（和 vite.config.ts 的开发期代理同一口径）。
+# 跨域白名单目前只写了 localhost:8091，改成同源反代即可，不必动后端代码。
+services:
+  cs-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cs-agent:latest
+    ports:
+      - "7861:7861"
+    volumes:
+      # 数据目录整体挂出来：SQLite、Chroma、上传文件、日志、备份快照都在里面
+      - ./src/backend/data:/app/data
+      # 密钥文件只读挂载；CS_CONFIG 是整文件替换，不与服务内 config.simple.yaml 合并
+      - ./src/backend/config.local.yaml:/app/config.local.yaml:ro
+    environment:
+      CS_CONFIG: /app/config.local.yaml
+    restart: unless-stopped

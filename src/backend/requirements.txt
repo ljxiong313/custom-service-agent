@@ -1,0 +1,46 @@
+# 版本区间策略：下界是代码实际用到的 API（低于它装不上就跑不通），上界是"没验证过的
+# 大版本不自动升"——>=1.0 的库锁下一个主版本，0.x 的库锁到当前已知可用的次版本线
+# （0.x 的 minor 变更经常破坏 API，比如 httpx 0.28 去掉了 proxies 参数）。
+# 升级方式：改上界 → 装新版 → 跑 py -m pytest tests -q + scripts/smoke_test.py，绿了才提交。
+# 开发/测试工具不在此文件，见 requirements-dev.txt。
+
+# ---- Web 框架 ----
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9,<0.1   # FastAPI 表单/文件上传（knowledge 上传接口）
+
+# ---- 数据层（SQLite/MySQL 均可，SQLModel 内置 SQLAlchemy）----
+sqlmodel>=0.0.22,<0.1
+# 直接 import sqlalchemy（裸 SQL、text()、bindparam 类型绑定），不靠 sqlmodel 传递引入
+SQLAlchemy>=2.0,<3.0
+
+# ---- 配置与鉴权 ----
+pyyaml>=6.0,<7.0
+pyjwt>=2.9,<3.0
+bcrypt>=4.1,<6.0
+pydantic>=2.8,<3.0             # 直接 import pydantic（api/v1 请求模型、Field 校验）
+
+# ---- LLM 接入（OpenAI 兼容接口，默认通义 dashscope）----
+langchain>=1.0,<2.0
+langchain-openai>=1.0,<2.0
+langchain-core>=1.0,<2.0
+tiktoken>=0.8,<1.0             # 记忆压缩按 token 截断
+httpx>=0.27,<0.29              # 平台回调/模型健康检查（0.28 起 proxies 参数已移除）
+
+# ---- P1 商品知识库：解析 / 分词 / 向量库 ----
+openpyxl>=3.1,<4.0             # Excel（app/services/rag/parser.py）
+pypdf>=4.0,<7.0                # PDF
+python-docx>=1.1,<2.0          # docx（import docx）
+chromadb>=1.0,<2.0             # 向量库（data/chroma/）；0.x 的 embedding/collection API 与 1.x 不同
+rank-bm25>=0.2.2,<0.3          # BM25Plus 关键词召回
+jieba>=0.42,<0.43              # 中文分词
+
+# ---- P3 企微回调消息加解密（import Crypto）----
+pycryptodome>=3.20,<5.0
+
+# ---- P4 MCP 工具接入 ----
+mcp>=1.0,<2.0                            # 含 mcp.server.fastmcp（scripts/demo_mcp_server.py）
+langchain-mcp-adapters>=0.1,<0.4         # MultiServerMCPClient
+
+# ---- 日志 ----
+loguru>=0.7,<0.8

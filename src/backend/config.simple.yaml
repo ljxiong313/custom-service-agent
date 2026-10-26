@@ -1,0 +1,169 @@
+# =============================================================================
+# 智能客服 Agent 主配置文件（P0 阶段）
+# -----------------------------------------------------------------------------
+# 加载优先级（见 app/config.py）：
+#   1. 环境变量 CS_CONFIG 指定的文件（推荐本地覆盖用 config.local.yaml，勿提交）
+#   2. 同目录下的 config.simple.yaml（本文件，作为默认值/模板）
+# 敏感信息（api_key、jwt_secret）本地放在 config.local.yaml 覆盖。
+# =============================================================================
+
+server:
+  host: 0.0.0.0
+  port: 7861          # 与 AgentChat(7860) 错开，便于同机并存开发
+
+database:
+  # 默认 SQLite，零依赖即可跑通；生产可切 mysql+pymysql://user:pwd@host/db
+  url: sqlite:///./data/cs_agent.db
+
+security:
+  jwt_secret: "dev-secret-change-me"   # 生产必须覆盖
+  jwt_algorithm: HS256
+  jwt_expire_minutes: 10080            # 7 天
+
+# -----------------------------------------------------------------------------
+# 多模型配置：全部走 OpenAI 兼容协议（ChatOpenAI），
+# key/base_url 等敏感字段请在 config.local.yaml 中覆盖。
+# -----------------------------------------------------------------------------
+multi_models:
+  dashscope:
+    api_key: ""                                                        # 通义灵积 API Key
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    chat_model: qwen-plus          # 对话模型
+    embedding_model: text-embedding-v4   # P1 RAG 使用；账号无该模型额度时换 qwen3.7-text-embedding
+    rerank_model: gte-rerank-v2          # P1 检索重排使用（无额度时 qwen3.7-text-rerank）
+    rerank_base_url: https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+    vl_model: qwen-vl-plus               # P1 图片知识库解析（无该模型额度时换 qwen3-vl-plus）
+    temperature: 0.3                     # 客服场景压低随机性
+
+default_model: dashscope
+
+# -----------------------------------------------------------------------------
+# 模型调用参数（B1-6）：chat / embedding / 视觉 / rerank 四条外呼共用超时与重试。
+# openai SDK 不设 timeout 时会一直挂在连接上，一个卡死的 embedding 调用能把整条
+# SSE 流拖住；max_retries 允许填 0（彻底关掉自动重试，重试次数不是越多越好——
+# 排队中的重试会让买家等两分钟）。
+# -----------------------------------------------------------------------------
+llm:
+  request_timeout_seconds: 60
+  max_retries: 2
+
+# -----------------------------------------------------------------------------
+# 记忆系统参数
+# -----------------------------------------------------------------------------
+memory:
+  short_max_tokens: 3000   # 短期记忆：单轮请求携带的历史消息 token 上限
+  long_enabled: true       # 长期画像抽取开关（关闭则不调模型抽取事实）
+
+# -----------------------------------------------------------------------------
+# 会话生命周期（P8）：买家会话空闲 idle_seconds 无新咨询 → 发送"是否结束会话"提示
+# （提示经平台出站送达买家）；再过 close_after_seconds 仍无回复 → 会话终结 closed，
+# 未结工单强制关闭（中断转人工），后续入站拒收。sweep 为后台扫描周期。
+# -----------------------------------------------------------------------------
+session:
+  idle_seconds: 300
+  close_after_seconds: 60
+  sweep_interval_seconds: 30
+
+# -----------------------------------------------------------------------------
+# RAG 检索参数（P1）
+# -----------------------------------------------------------------------------
+rag:
+  chunk_size: 500          # 分块目标 token 数
+  chunk_overlap: 100       # 块间重叠 token 数
+  recall_k: 20             # 单路召回数量（向量/BM25 各取 K 条再融合）
+  top_k: 5                 # 最终送给模型/展示的结果条数
+  chroma_path: ""          # 留空 = data/chroma/
+  ingest_workers: 2        # 入库/重建并发线程数（B1-2）。开太大只是同时打 embedding 限流
+
+# -----------------------------------------------------------------------------
+# MCP（P4）。stdio 传输会在本机拉起一个进程，等于把"执行任意命令"交给了
+# 能在管理页填表的人，所以命令名必须在白名单内（比较时忽略大小写、目录与 .exe）。
+# 留空或删掉本节 = 使用代码内置白名单；确实需要放行别的程序时在这里追加，
+# 不要放宽到 shell。
+# -----------------------------------------------------------------------------
+mcp:
+  allowed_commands: [python, python3, py, node, npx, uv, uvx]
+
+# -----------------------------------------------------------------------------
+# 企业微信（P3）。mock=true 时不外呼：卡片记入内存 outbox，工作台可查，
+# 本地即可演示完整转人工闭环。正式对接填 corp_id 等并在企微后台配置回调 URL：
+#   https://<你的域名>/api/wecom/callback（GET 验证 + POST 收消息）
+# -----------------------------------------------------------------------------
+wecom:
+  mock: true
+  corp_id: ""
+  corp_secret: ""
+  agent_id: 0
+  touser: ""               # 默认接收客服的企微 userid，@all 表示广播给应用可见成员
+  callback_token: ""
+  encoding_aes_key: ""     # 43 位
+  workbench_url: ""        # 卡片跳转的客服工作台地址
+
+# -----------------------------------------------------------------------------
+# 电商平台接入（P7）：淘宝 / 京东 / 拼多多 / 抖店。
+# 回调 URL 统一为 https://<你的域名>/api/platform/{platform}/callback
+# mock=true（默认）：验签放行、回复进内存外发箱，无需平台资质即可演示全链路。
+# 各字段口径、待核对(★)项与填法详见 docs/平台接入.md —— 拿到凭证后逐项替换即可。
+# -----------------------------------------------------------------------------
+platforms:
+  taobao:
+    enabled: true
+    mock: true
+    app_key: ""            # 淘宝开放平台应用 AppKey
+    app_secret: ""         # AppSecret（TOP 签名用）
+    access_token: ""       # 授权卖家后获得的 session（top SDK 里称 access_token）
+    session_key: ""        # 同上，二选一即可（历史字段名）
+    gateway: "https://gw.api.taobao.com/router/rest"
+    reply_method: ""       # ★ 客服消息发送 API 方法名，核对官方文档后填写
+    callback_verify: "sign"   # "sign"=按 TOP md5 验签；"none"=本地调试跳过（勿用于生产）
+    to_uid_field: "to_uid"    # 回复参数里"收件买家"字段名（★核对）
+    content_field: "content"  # 回复参数里"消息内容"字段名（★核对）
+    media_method: ""       # ★ 媒体消息发送 API；留空则买家只收到 [附件] 链接文本
+    media_url_field: "pic_url"    # 媒体参数里"地址"字段名（★核对）
+    media_type_field: "msg_type"  # 媒体参数里"类型"字段名（★核对）
+    ack: { code: 0, msg: "success" }   # 回调即时应答体（各平台要求不同，★核对）
+  jd:
+    enabled: true
+    mock: true
+    app_key: ""
+    app_secret: ""
+    access_token: ""       # 京东授权令牌（系统参数名即 access_token）
+    gateway: "https://api.jd.com/routerjson"
+    reply_method: ""       # ★
+    callback_verify: "sign"
+    to_uid_field: "to_uid"
+    content_field: "content"
+    media_method: ""       # ★
+    media_url_field: "pic_url"
+    media_type_field: "msg_type"
+    ack: { code: 0, msg: "success" }
+  pdd:
+    enabled: true
+    mock: true
+    app_key: ""            # 拼多多 client_id
+    app_secret: ""
+    access_token: ""
+    gateway: "https://gateway.pinduoduo.com/api"
+    reply_method: ""       # ★ 如 pdd.chat 相关发送接口，核对后填写
+    callback_verify: "sign"
+    to_uid_field: "to_uid"
+    content_field: "content"
+    media_method: ""       # ★
+    media_url_field: "pic_url"
+    media_type_field: "msg_type"
+    ack: { error: { } }    # 拼多多要求返回 {"error":{"code":...}} 结构，★核对
+  douyin:
+    enabled: true
+    mock: true
+    app_key: ""            # 抖店开放平台 app_key
+    app_secret: ""         # HMAC-SHA256 签名密钥
+    access_token: ""       # 店铺授权令牌
+    gateway: "https://openapi.jinritemai.com/"   # ★ 前缀，方法名直接拼接
+    reply_method: ""       # ★ 例：飞鸽客服消息发送 API 路径
+    callback_verify: "sign"   # sign = HMAC-SHA256(timestamp + body)（★多版本并存，核对）
+    to_uid_field: "sender_uid"
+    content_field: "content"
+    media_method: ""       # ★
+    media_url_field: "pic_url"
+    media_type_field: "msg_type"
+    ack: { code: 0, msg: "success" }
