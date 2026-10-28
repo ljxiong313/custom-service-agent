@@ -282,6 +282,14 @@ class OutboxRecord(SQLModel, table=True):
     """出站消息落库（B1-2）：企微卡片与各平台 mock 外发原来只活在进程内存里，重启即丢。
 
     运营台/设置页的外发箱读这张表；channel=wecom 归转人工卡片，其余为平台名。
+
+    重试三列（出站失败退避重试）：失败不再"写一次就完"。
+    - attempts：已尝试外呼的次数（首次发送算第 1 次；0 = 本行从未参与自动重试，
+      例如企微卡片与 mock/skipped 记录）；
+    - next_retry_at：到点才重试；**失败行且 attempts>0 而 next_retry_at 为空就是死信**
+      （重试次数用尽，等人工处理）；
+    - last_error：最近一次失败的报文，排查时不必再去翻日志。
+    时间一律带时区（SQLModel 的 UTCDateTime 拒绝 naive datetime）。
     """
 
     id: int | None = Field(default=None, primary_key=True)
@@ -293,4 +301,124 @@ class OutboxRecord(SQLModel, table=True):
     payload_json: str = "{}"                # 完整发送载荷（mock 时也记，便于对照真实报文）
     status: str = Field(default="mocked", index=True)  # mocked / sent / failed / skipped
     error: str | None = None
+    attempts: int = 0                       # 已尝试外呼次数（退避重试用）
+    # 不加索引：取到期行本来就按 status（已建索引）过滤，小表扫不到哪儿去，
+    # 而 create_all 只会给**新库**建索引，老库补出来的列带不带索引口径不一致更容易误导。
+    next_retry_at: datetime.datetime | None = None
+    last_error: str | None = None           # 最近一次重试失败的报文
+    created_at: datetime.datetime = Field(default_factory=utcnow, index=True)
+
+
+# =============================================================================
+# B3-7 计量与可观测
+# =============================================================================
+
+class LlmCall(SQLModel, table=True):
+    """每次模型外呼的用量流水（B3-7）。
+
+    没有这张表就没有成本、没有错误率、也没有"这个月哪个模型烧了多少钱"的答案——
+    用量只存在于调用的一瞬间，事后补不回来。
+    embedding/rerank 两类接口不返回 usage_metadata，按本地估算并标 estimated=True，
+    读的人必须能分辨"模型上报值"与"本地估算值"。
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    kind: str = Field(index=True)                  # chat / embedding / rerank / vision
+    provider: str = ""                             # multi_models 下的配置名
+    model: str = ""
+    conversation_id: int | None = Field(default=None, index=True)
+    user_id: int | None = Field(default=None, index=True)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    estimated: bool = False                        # True = 本地估算，不是模型上报
+    cost_est: float | None = None                  # 按 llm.pricing 估算的金额（未配价为 None）
+    latency_ms: int = 0
+    attempts: int = 1                              # >1 说明走过备用模型链
+    status: str = Field(default="ok", index=True)  # ok / error
+    error: str | None = None
+    created_at: datetime.datetime = Field(default_factory=utcnow, index=True)
+
+
+class ToolConfirmRequest(SQLModel, table=True):
+    """MCP 写操作确认请求（B3-8 落库）。
+
+    旧实现是进程内的 asyncio.Future 表：确认请求只能由同一个进程裁决，多副本下
+    点卡片的请求很可能落到"没有这个 future"的进程上，必然超时拒绝；进程重启更会把
+    正在等待的对话直接挂死。改成状态机后，等待方按轮询读库、任何进程都能裁决，
+    重启也不丢待办。
+
+    status: pending → approved / rejected / expired（无人应答超时）
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    request_id: str = Field(index=True, unique=True)   # 下发给前端的短 id（12 位 hex）
+    conversation_id: int = Field(foreign_key="conversation.id", index=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    tool_name: str = ""
+    args_json: str = "{}"
+    status: str = Field(default="pending", index=True)
+    decided_by: int | None = Field(default=None, foreign_key="user.id")
+    created_at: datetime.datetime = Field(default_factory=utcnow, index=True)
+    decided_at: datetime.datetime | None = None
+
+
+# =============================================================================
+# B3-8 多进程协调
+# =============================================================================
+
+class WorkerLease(SQLModel, table=True):
+    """后台任务的租约选主（B3-8）：谁持约谁干活，续约靠时间戳自然失效。
+
+    只有一个主键列 name，所以"抢约"是一条带条件的 UPDATE（行已存在）或一次 INSERT
+    （首次），两条都是原子的。持约进程被杀掉不再续约时，下一个扫描周期就有别的进程
+    接管——不需要外部协调服务（ZooKeeper/Redis），代价是切换要等一个 TTL。
+    """
+
+    name: str = Field(primary_key=True)               # session_sweeper / memory_pipeline / ...
+    holder: str = Field(default="", index=True)       # 进程标识：hostname:pid:uuid4 前 8 位
+    epoch: int = 0                                    # 每次成功持约 +1，便于排查"抖动/抢占"
+    lease_expires_at: datetime.datetime | None = None
+    updated_at: datetime.datetime = Field(default_factory=utcnow)
+
+
+class MemoryJob(SQLModel, table=True):
+    """记忆管道任务（B3-8 落库）。
+
+    旧实现是 `asyncio.create_task` + 进程内 `_running` 去重集合：重启时正在抽取的
+    摘要/画像直接蒸发（当轮对话不受影响，但那几轮的长期记忆就永久缺了一段），
+    多进程部署还会对同一会话并发抽取、写出重复画像。
+    现在任务有行、抢占用带条件的 UPDATE，启动时把中断的收回重跑。
+
+    status: queued → running → done / failed
+    stage:  both / summary / facts（哪一段没跑成，重跑时只补那一段）
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    conversation_id: int = Field(foreign_key="conversation.id", index=True)
+    user_id: int = Field(default=0, index=True)
+    stage: str = Field(default="both", index=True)
+    status: str = Field(default="queued", index=True)
+    attempts: int = 0
+    error: str | None = None
+    created_at: datetime.datetime = Field(default_factory=utcnow, index=True)
+    updated_at: datetime.datetime = Field(default_factory=utcnow)
+
+
+class SessionRating(SQLModel, table=True):
+    """会话满意度评分（B3-13）。
+
+    一行一会话（unique）：买家重复点回访链接只算第一票，后面按"已评价"拒绝，
+    否则最后一个分数会覆盖前面的，均分就变成了"最后一次心情"。
+
+    回访链接带 HMAC 签名且**只指向这一个会话**（免 JWT，因为买家不在我们站内登录），
+    所以拿到链接的人只能给这一会话投一次票。满意度是趋势指标，不是审计级数据：
+    同一个人换会话链接、或把链接转给同事代填，都挡不住，别拿它做绩效唯一依据。
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    conversation_id: int = Field(foreign_key="conversation.id", unique=True, index=True)
+    rating: int                                  # 1..5
+    comment: str = ""
+    source: str = Field(default="survey_link", index=True)   # survey_link / operator
     created_at: datetime.datetime = Field(default_factory=utcnow, index=True)

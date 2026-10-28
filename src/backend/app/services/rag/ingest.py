@@ -5,6 +5,12 @@
 失败处理：任何一步异常 → status=failed + error 文案（前端可见），已写入的
 chunk/向量整体回滚删除，保证不残留半成品。向量化单独失败只降级（error 提示，
 BM25 仍可用），不推翻已入库的切片。
+向量化降级的口径（B1-9）：批级重试后仍失败的切片**不静默丢弃**——其余批次照常被向量化，
+最后汇总成一条带"失败批次/受影响切片"的错误写进 KnowledgeFile.error（上传/重入库）或
+IngestJob.error（由任务层从 file.error 透传；重建向量路径则直接 failed 落 IngestJob.error）。
+
+BM25 侧：本模块是 Chunk 表的唯一写路径，每次改变语料集合后都调 text_index.invalidate()
+丢掉进程内索引；跨进程/重启的正确性由 bm25_store 的语料版本标记兜住（见那两个模块的注释）。
 """
 from __future__ import annotations
 
@@ -16,9 +22,26 @@ from sqlmodel import Session, col, select
 
 from app.db.models import Chunk, IngestJob, KnowledgeFile, Product, pk
 
-from . import parser, vectorstore
+from . import parser, text_index, vectorstore
 from .chunker import chunk_text
 from .parser import ProductRow
+
+
+def _index_dirty() -> None:
+    """语料集合变了：丢弃进程内 BM25 索引（下一次检索按新版本重建）。"""
+    text_index.invalidate()
+
+
+def _restore_vector_enabled(file_id: int, enabled: bool) -> None:
+    """把该文件向量的 enabled 元数据还原成文件状态。
+
+    add_chunks 写死的 metadata 是 enabled=True（重新入库时向量本来就是这个状态），
+    部分批次向量化失败时也必须还原，否则"禁用文件"的切片会被向量路召回。
+    """
+    try:
+        vectorstore.set_file_enabled(file_id, enabled)
+    except Exception as e:  # noqa: BLE001 - 元数据还原失败只是展示/召回口径问题，不能盖掉主错误
+        logger.warning("向量 enabled 还原失败（file#{}）: {}", file_id, e)
 
 
 def ingest_file(session: Session, file: KnowledgeFile, *, purge_first: bool = False,
@@ -32,6 +55,7 @@ def ingest_file(session: Session, file: KnowledgeFile, *, purge_first: bool = Fa
     file.error = None
     session.add(file)
     session.commit()
+    _index_dirty()
     if purge_first:
         purge(session, file)
     file_id = pk(file)      # 已落库文件的 int 主键（Chunk/Product/向量 metadata 都存它）
@@ -55,11 +79,12 @@ def ingest_file(session: Session, file: KnowledgeFile, *, purge_first: bool = Fa
                 vectorstore.add_chunks([(cid, texts[i], file_id, file.name)
                                         for i, cid in enumerate(created_chunk_ids)],
                                        progress=progress)
-                # add_chunks 写入的 metadata 恒为 enabled=True，重新入库禁用的文件要还原
-                vectorstore.set_file_enabled(file_id, file.enabled)
             except Exception as e:
-                degrade_note = f"向量化失败（仅关键词检索可用）: {e}"[:300]
+                # 显式降级（旧行为同款提示，但带上失败批次/受影响切片，运维才知道要补多少）
+                degrade_note = f"向量化失败（仅关键词检索可用）: {e}"[:500]
                 logger.warning("知识库向量化降级: {}", degrade_note)
+            finally:
+                _restore_vector_enabled(file_id, file.enabled)
 
         for prow in parsed.products:
             _upsert_product(session, prow, file_id)
@@ -82,6 +107,7 @@ def ingest_file(session: Session, file: KnowledgeFile, *, purge_first: bool = Fa
         file.error = str(e)[:500]
     session.add(file)
     session.commit()
+    _index_dirty()
 
 
 def remove_file(session: Session, file: KnowledgeFile) -> None:
@@ -100,6 +126,7 @@ def remove_file(session: Session, file: KnowledgeFile) -> None:
         session.delete(j)
     session.delete(file)
     session.commit()
+    _index_dirty()
 
 
 def purge(session: Session, file: KnowledgeFile) -> tuple[list[int], int]:
@@ -108,9 +135,9 @@ def purge(session: Session, file: KnowledgeFile) -> tuple[list[int], int]:
     重新入库前的清理：解析器/分块器改进后旧切片不会自己变，必须先清再重建，
     否则新旧切片同时被召回（回答里混入重复内容）。
 
-    返回被删的 chunk id 列表与商品行数：BM25 每次检索从 Chunk 表现取现建（见
-    text_index.py），所以清完即生效、不需要额外失效通知；调用方拿数量只够写日志，
-    真要核对"旧产物清干净了没有"必须用 id 列表。
+    返回被删的 chunk id 列表与商品行数：调用方拿数量只够写日志，真要核对
+    "旧产物清干净了没有"必须用 id 列表。BM25 侧不再"每次现取现建"，所以清完必须
+    显式失效（下面 _index_dirty）；跨进程还有语料版本标记兜底，检索结果不会拿到旧切片。
     """
     chunks = session.exec(select(Chunk).where(Chunk.file_id == file.id)).all()
     ids = [pk(c) for c in chunks]
@@ -123,6 +150,7 @@ def purge(session: Session, file: KnowledgeFile) -> tuple[list[int], int]:
     file.chunk_count = 0
     session.add(file)
     session.commit()
+    _index_dirty()
     return ids, len(products)
 
 
@@ -132,6 +160,10 @@ def reindex_file(session: Session, file: KnowledgeFile,
 
     适用：换 embedding 模型（向量空间整个变了）、或上传时向量化失败只落了 BM25 后补建。
     同 id 先删后写，重复调用幂等。
+
+    失败口径：批级重试后仍有批次失败时抛 EmbeddingBatchError（错误文案含失败批次与受影响
+    切片），任务层据此把 IngestJob.error / KnowledgeFile.error 写成可见的失败，而不是
+    "看起来成功了但一半切片没向量"。BM25 语料未变，无需失效。
     """
     file_id = pk(file)
     chunks = session.exec(
@@ -139,9 +171,11 @@ def reindex_file(session: Session, file: KnowledgeFile,
     if not chunks:
         return 0
     vectorstore.remove_chunks([pk(c) for c in chunks])
-    vectorstore.add_chunks([(pk(c), c.text, file_id, file.name) for c in chunks],
-                           progress=progress)
-    vectorstore.set_file_enabled(file_id, file.enabled)
+    try:
+        vectorstore.add_chunks([(pk(c), c.text, file_id, file.name) for c in chunks],
+                               progress=progress)
+    finally:
+        _restore_vector_enabled(file_id, file.enabled)
     if file.error and "向量化失败" in file.error:
         file.error = None
         session.add(file)

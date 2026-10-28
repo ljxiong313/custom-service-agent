@@ -41,16 +41,22 @@ def ensure_summary(session: Session, conversation_id: int) -> None:
     if len(pending) < 6:  # 太碎不值得调模型，攒够再摘要
         return
 
-    from app.core.models.manager import get_chat_model
-
     transcript = "\n".join(f"{'用户' if m.role == 'user' else '客服'}: {m.content[:200]}"
                            for m in pending)
     old = f"已有摘要：{row.summary}\n\n" if row else ""
     prompt = (f"{old}请把新的对话记录合并进摘要，输出 120 字以内的中文要点"
               f"（保留：用户诉求、涉及商品与结论、未决事项）。只输出摘要正文。\n\n{transcript}")
+    from app.core.models.manager import get_chat_model, model_id, resolve_name
+    from app.services import usage
+
     try:
-        resp = get_chat_model().invoke(prompt)
-        text = resp.text if hasattr(resp, "text") else str(resp.content)
+        with usage.track("chat", provider=resolve_name(), model=model_id("chat"),
+                         conversation_id=conversation_id) as st:
+            st["inputs"] = [prompt]
+            resp = get_chat_model().invoke(prompt)
+            text = resp.text if hasattr(resp, "text") else str(resp.content)
+            st["usage"] = getattr(resp, "usage_metadata", None) or {}
+            st["outputs"] = [text]
     except Exception as e:
         logger.warning("中期摘要生成失败（跳过本轮）: {}", e)
         return

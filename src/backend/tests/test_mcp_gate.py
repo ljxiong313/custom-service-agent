@@ -11,19 +11,31 @@ import pytest
 from sqlmodel import Session, select
 
 from app.config import get_settings
-from app.db.models import McpServer
+from app.db.models import Conversation, McpServer, ToolConfirmRequest, User
 from app.db.session import engine
 from app.services.mcp import confirm, manager
 
 API = "/api/v1"
 
 
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    """确认注册表是进程内单例：用例之间必须干净，否则 pending_count 断言互相污染。"""
-    confirm._pending.clear()
-    yield
-    confirm._pending.clear()
+def _seed_target(username: str) -> tuple[int, int]:
+    """造一条真实"用户+会话"，返回 (conversation_id, user_id)。
+
+    B3-8 起确认请求落库：toolconfirmrequest 对 conversation.id / user.id 有外键，
+    且 SQLite 连接开了 PRAGMA foreign_keys=ON，create_request 只能用真实主键，
+    随便编的 id 会直接 IntegrityError。conftest 的 _clean_tables 每用例清库，
+    所以每用例自己种一次即可，不再需要清理进程内注册表（它已不存在）。
+    """
+    with Session(engine) as s:
+        user = User(username=username, hashed_password="x", role="user")
+        s.add(user)
+        s.commit()
+        s.refresh(user)
+        conv = Conversation(user_id=user.id, title="确认测试会话")
+        s.add(conv)
+        s.commit()
+        s.refresh(conv)
+        return conv.id, user.id
 
 
 # ---- 白名单 ----
@@ -134,12 +146,19 @@ def test_duplicate_name_conflicts(client, admin):
 # ---- 工具确认注册表 ----
 
 def test_confirm_roundtrip_resolves_waiter():
-    """runner 挂在 future 上等确认：前端点"允许"后必须立刻拿到 True 并继续调用工具。"""
+    """runner 轮询库等确认：点"允许"把行置为 approved 后，等待方必须拿到 True 并继续调用工具。
+
+    轮询语义（POLL_SECONDS=1）：wait_decision 第一轮读到 pending 后睡 1 秒，
+    期间 resolve 写库，醒来第二轮看到终态——所以这里会比旧 future 版慢约 1 秒，
+    但测的仍是"等待方能拿到裁决"这件事，断言不放宽。
+    """
+    conv_id, user_id = _seed_target("waiter1")
+
     async def scenario():
-        rid = confirm.create_request(1, 2, "order_query", {"order_id": "A1"})
+        rid = confirm.create_request(conv_id, user_id, "order_query", {"order_id": "A1"})
         assert confirm.pending_count() == 1
         task = asyncio.create_task(confirm.wait_decision(rid, timeout=5))
-        await asyncio.sleep(0)                      # 让 waiter 真的挂到 future 上
+        await asyncio.sleep(0)                      # 让 waiter 真的进入轮询（第一轮已读到 pending）
         assert confirm.resolve(rid, True) is True
         return await task
 
@@ -148,8 +167,10 @@ def test_confirm_roundtrip_resolves_waiter():
 
 
 def test_confirm_deny_and_unknown_request():
+    conv_id, user_id = _seed_target("waiter2")
+
     async def scenario():
-        rid = confirm.create_request(1, 2, "refund_apply", {})
+        rid = confirm.create_request(conv_id, user_id, "refund_apply", {})
         task = asyncio.create_task(confirm.wait_decision(rid, timeout=5))
         await asyncio.sleep(0)
         assert confirm.resolve(rid, False) is True
@@ -161,57 +182,72 @@ def test_confirm_deny_and_unknown_request():
 
 
 def test_prune_expires_silently_waiting_requests():
-    """没人点确认时必须自动按拒绝收场，否则 future 和注册表会一直挂着。"""
+    """没人点确认时必须自动按拒绝收场：prune 把 pending 置 expired，等待方下一轮就看到终态。"""
+    conv_id, user_id = _seed_target("waiter3")
+
     async def scenario():
-        rid = confirm.create_request(7, 1, "order_query", {})
+        rid = confirm.create_request(conv_id, user_id, "order_query", {})
         task = asyncio.create_task(confirm.wait_decision(rid, timeout=30))
         await asyncio.sleep(0)
         assert confirm.prune(max_age=-1) == 1                  # 视为已过期
         assert await task is False                             # 超时前就被置为拒绝
         assert confirm.pending_count() == 0
+        with Session(engine) as s:                             # 终态留在库里可审计，不被改写
+            row = s.exec(select(ToolConfirmRequest).where(
+                ToolConfirmRequest.request_id == rid)).first()
+            assert row is not None and row.status == "expired"
 
     asyncio.run(scenario())
 
 
 def test_pending_list_carries_conversation_and_args():
     """运营台要能替没有 SSE 的渠道点确认，所以列表必须带会话与参数。"""
+    conv_id, user_id = _seed_target("waiter4")
+
     async def scenario():
-        rid = confirm.create_request(42, 5, "order_query", {"order_id": "X9"})
+        rid = confirm.create_request(conv_id, user_id, "order_query", {"order_id": "X9"})
         row = next(i for i in confirm.pending_list() if i["request_id"] == rid)
-        assert row["conversation_id"] == 42 and row["tool_name"] == "order_query"
+        assert row["conversation_id"] == conv_id and row["tool_name"] == "order_query"
         assert row["args"] == {"order_id": "X9"} and row["created_at"] <= time.time()
         confirm.prune(max_age=-1)
 
     asyncio.run(scenario())
 
 
-def test_pending_api_and_confirm_endpoint(client, admin, monkeypatch):
-    """接口层：/mcp/pending 透出卡片，/mcp/confirm 一张卡片只能点一次，之后再点 410。"""
-    loop = asyncio.new_event_loop()
-    try:
-        entry = confirm._Pending(request_id="abc123", conversation_id=9, user_id=1,
-                                 tool_name="order_query", args={"id": 1},
-                                 created_at=time.time(), future=loop.create_future())
-        monkeypatch.setitem(confirm._pending, "abc123", entry)
+def test_pending_api_and_confirm_endpoint(client, admin):
+    """接口层：/mcp/pending 透出卡片，/mcp/confirm 一张卡片只能点一次，之后再点 410。
 
-        body = client.get(f"{API}/mcp/pending", headers=admin["headers"]).json()
-        assert [i["request_id"] for i in body["items"]] == ["abc123"]
-        assert body["items"][0]["tool_name"] == "order_query"
+    旧版往进程内 _pending 塞 _Pending 假条目并断言 entry.future.result() is True；
+    注册表已删，改为走真实链路（建会话 → create_request 落库），
+    "future 被置 True"改测成"库行状态变 approved"——这是落库后的等价断言，
+    并额外断言 decided_by 记录了操作者 id（新实现带来的审计能力）。
+    """
+    conv_id = client.post(f"{API}/conversations", headers=admin["headers"],
+                          json={"title": "待确认"}).json()["id"]
+    rid = confirm.create_request(conv_id, admin["user"]["id"], "order_query", {"id": 1})
 
-        assert client.post(f"{API}/mcp/confirm", headers=admin["headers"],
-                           json={"request_id": "abc123", "approved": True}).status_code == 200
-        assert entry.future.result() is True            # runner 那边等的就是这个结果
-        gone = client.post(f"{API}/mcp/confirm", headers=admin["headers"],
-                           json={"request_id": "abc123", "approved": False})
-        assert gone.status_code == 410 and "过期" in gone.json()["detail"]
-        assert client.get(f"{API}/mcp/pending", headers=admin["headers"]).json()["items"] == []
-    finally:
-        loop.close()
+    body = client.get(f"{API}/mcp/pending", headers=admin["headers"]).json()
+    assert [i["request_id"] for i in body["items"]] == [rid]
+    assert body["items"][0]["tool_name"] == "order_query"
+
+    assert client.post(f"{API}/mcp/confirm", headers=admin["headers"],
+                       json={"request_id": rid, "approved": True}).status_code == 200
+    with Session(engine) as s:
+        row = s.exec(select(ToolConfirmRequest).where(
+            ToolConfirmRequest.request_id == rid)).first()
+        assert row is not None
+        assert row.status == "approved"                  # runner 等的就是这个裁决结果
+        assert row.decided_by == admin["user"]["id"]     # 审计：谁批的必须留名
+        assert row.decided_at is not None
+    gone = client.post(f"{API}/mcp/confirm", headers=admin["headers"],
+                       json={"request_id": rid, "approved": False})
+    assert gone.status_code == 410 and "过期" in gone.json()["detail"]
+    assert client.get(f"{API}/mcp/pending", headers=admin["headers"]).json()["items"] == []
 
 
-def test_system_status_counts_pending(client, admin, monkeypatch):
-    entry = confirm._Pending(request_id="zzz", conversation_id=9, user_id=1,
-                             tool_name="order_query", created_at=time.time())
-    monkeypatch.setitem(confirm._pending, "zzz", entry)
+def test_system_status_counts_pending(client, admin):
+    conv_id = client.post(f"{API}/conversations", headers=admin["headers"],
+                          json={"title": "待确认"}).json()["id"]
+    confirm.create_request(conv_id, admin["user"]["id"], "order_query", {})
     body = client.get(f"{API}/system/status", headers=admin["headers"]).json()
     assert body["mcp_pending_confirm"] == 1

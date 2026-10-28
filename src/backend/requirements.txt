@@ -13,6 +13,8 @@ python-multipart>=0.0.9,<0.1   # FastAPI 表单/文件上传（knowledge 上传�
 sqlmodel>=0.0.22,<0.1
 # 直接 import sqlalchemy（裸 SQL、text()、bindparam 类型绑定），不靠 sqlmodel 传递引入
 SQLAlchemy>=2.0,<3.0
+# 生产迁移体系：database.migrate_mode=alembic 时启动要跑 upgrade head，所以是运行依赖不是开发依赖
+alembic>=1.13,<2.0
 
 # ---- 配置与鉴权 ----
 pyyaml>=6.0,<7.0

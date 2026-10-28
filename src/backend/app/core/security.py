@@ -15,7 +15,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlmodel import Session
 
 from app.config import get_settings
-from app.db.models import User
+from app.db.models import Conversation, User
 from app.db.session import get_session
 
 _bearer = HTTPBearer(auto_error=False)
@@ -69,7 +69,7 @@ def require_admin(user: Annotated[User, Depends(get_current_user)]) -> User:
     """管理端点门禁（B1-7）。
 
     role 一律现查库、不写进 JWT：改角色要立刻生效，否则要等 token 自然过期（默认 7 天）。
-    这里挡住的三类操作都有机器级后果：MCP 配置能以 stdio 拉起本机任意命令、
+    这里挡住的三类操作都有机器级后果：MCP 配置能以 stdio 拉起本机命令、
     知识库写操作会改召回语料、角色变更本身。
     """
     if user.role != "admin":
@@ -78,3 +78,27 @@ def require_admin(user: Annotated[User, Depends(get_current_user)]) -> User:
 
 
 RequireAdmin = Annotated[User, Depends(require_admin)]
+
+
+def is_staff(user: User) -> bool:
+    """客服及以上（staff/admin）：可以代答他人会话、点确认卡片、处理工单。"""
+    return user.role in ("admin", "staff")
+
+
+def require_staff(user: Annotated[User, Depends(get_current_user)]) -> User:
+    if not is_staff(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "该操作需要客服权限")
+    return user
+
+
+RequireStaff = Annotated[User, Depends(require_staff)]
+
+
+def can_access_conversation(user: User, conv: Conversation) -> bool:
+    """会话归属判定：客服及以上全量可见，普通用户只能看自己的会话。
+
+    B3-6 之前运营台的跨用户只读+代答对**所有登录用户**开放（演示形态），这意味着
+    任何买家账号都能读到别人的聊天记录和工具入参。收紧成角色 + 归属双条件后，
+    客服团队协同的口径保持不变，普通账号退化为"只看自己"。
+    """
+    return is_staff(user) or conv.user_id == user.id

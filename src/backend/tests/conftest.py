@@ -20,7 +20,13 @@ _CONFIG = _TMP / "config.test.yaml"
 _CONFIG.write_text(f"""
 server: {{ host: 127.0.0.1, port: 7861 }}
 database: {{ url: sqlite:///{(_TMP / 'test.db').as_posix()} }}
-security: {{ jwt_secret: test-secret-0123456789abcdef-0123456789abcdef, jwt_algorithm: HS256, jwt_expire_minutes: 60 }}
+security:
+  jwt_secret: test-secret-0123456789abcdef-0123456789abcdef
+  jwt_algorithm: HS256
+  jwt_expire_minutes: 60
+  media_url_ttl_seconds: 3600
+  # 单测里同一账号会连着打几十个写请求，限流会误伤；限流本身在 test_observability.py 单独验
+  rate_limit: {{ enabled: false }}
 multi_models:
   dashscope:
     api_key: ""
@@ -32,7 +38,7 @@ multi_models:
     vl_model: ""
     temperature: 0
 default_model: dashscope
-llm: {{ request_timeout_seconds: 5, max_retries: 0 }}
+llm: {{ request_timeout_seconds: 5, max_retries: 0, fallback: [] }}
 memory: {{ short_max_tokens: 2000, long_enabled: false }}
 # 扫描间隔拉长到 1 小时：测试自己调用 sweep_once，不让 lifespan 的后台任务插队
 session: {{ idle_seconds: 100000, close_after_seconds: 100000, sweep_interval_seconds: 3600 }}
@@ -54,6 +60,9 @@ wecom:
   encoding_aes_key: ""
   workbench_url: ""
 platforms:
+  # 同上：外发重试循环默认 15s，会把用例刚写下的 failed 行真去重投一次（打到 127.0.0.1:9），
+  # 用例断言 next_retry_at/attempts 就变成看时机了。重试逻辑由 test_outbox_retry.py 直接驱动。
+  retry_interval_seconds: 3600
   taobao: {{ enabled: true, mock: true, gateway: "http://127.0.0.1:9/taobao", reply_method: "", callback_verify: "sign", to_uid_field: "to_uid", content_field: "content", ack: {{ code: 0, msg: "success" }} }}
   jd: {{ enabled: true, mock: true, gateway: "http://127.0.0.1:9/jd", reply_method: "", callback_verify: "sign", to_uid_field: "to_uid", content_field: "content", ack: {{ code: 0, msg: "success" }} }}
   pdd: {{ enabled: true, mock: true, gateway: "http://127.0.0.1:9/pdd", reply_method: "", callback_verify: "sign", to_uid_field: "to_uid", content_field: "content", ack: {{ error: {{}} }} }}
@@ -64,8 +73,9 @@ os.environ["CS_CONFIG"] = str(_CONFIG)
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlmodel import Session, SQLModel  # noqa: E402
+from sqlmodel import Session, SQLModel, select  # noqa: E402
 
+from app.db.models import User  # noqa: E402
 from app.db.session import engine  # noqa: E402  导入即按上面的临时配置建库
 
 
@@ -114,13 +124,41 @@ def register(client: TestClient, username: str, password: str = "secret123") -> 
 
 @pytest.fixture
 def admin(client: TestClient) -> dict:
-    return register(client, "boss")
+    row = register(client, "boss")
+    # 钉死角色：某些用例的参数顺序会让 buyer/staff 先注册，"第一个账号天然是 admin"
+    # 就不再成立，admin fixture 必须自己保证自己是 admin。
+    _set_role("boss", "admin")
+    return row
+
+
+def _set_role(username: str, role: str) -> None:
+    """把账号角色钉死在库里。
+
+    不走 PATCH /auth/users/{id}/role：那个接口本身要 admin，而 fixture 之间的解析顺序
+    （buyer 可能排在 admin 前面）会让"谁是第一个账号"随用例漂移，角色断言就会时好时坏。
+    """
+    with Session(engine) as session:
+        row = session.exec(select(User).where(User.username == username)).first()
+        assert row is not None, f"账号 {username} 未注册"
+        row.role = role
+        session.add(row)
+        session.commit()
 
 
 @pytest.fixture
-def staff(client: TestClient, admin: dict) -> dict:
-    """admin 之后注册的账号：role=user，用于断言写操作门禁。"""
-    return register(client, "cs01")
+def staff(client: TestClient) -> dict:
+    """真客服账号（role=staff）：覆盖运营台的全量视角（跨用户会话、工单、确认卡片）。"""
+    row = register(client, "cs01")
+    _set_role("cs01", "staff")
+    return row
+
+
+@pytest.fixture
+def buyer(client: TestClient) -> dict:
+    """普通用户账号（role=user）：只应看到自己的会话/工单/确认卡片。"""
+    row = register(client, "buyer01")
+    _set_role("buyer01", "user")
+    return row
 
 
 @pytest.fixture

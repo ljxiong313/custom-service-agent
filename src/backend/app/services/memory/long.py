@@ -35,7 +35,8 @@ def extract_facts(session: Session, conversation_id: int, user_id: int) -> int:
     if len(msgs) < 2:
         return 0
 
-    from app.core.models.manager import get_chat_model
+    from app.core.models.manager import get_chat_model, model_id, resolve_name
+    from app.services import usage
 
     transcript = "\n".join(f"{'用户' if m.role == 'user' else '客服'}: {m.content[:200]}" for m in msgs)
     prompt = (
@@ -43,8 +44,14 @@ def extract_facts(session: Session, conversation_id: int, user_id: int) -> int:
         "（偏好、预算、身份特征、购买意向、重要结论），忽略一次性寒暄与商品本身的信息。\n"
         '只输出 JSON 数组，如 ["用户偏好性价比高的国产品牌面霜"]；没有则输出 []。\n\n' + transcript)
     try:
-        resp = get_chat_model().invoke(prompt)
-        text = (resp.text if hasattr(resp, "text") else str(resp.content)).strip()
+        # 计量只包外呼本身：JSON 解析失败是模型输出不合规，不是网络失败，不该混进错误率。
+        with usage.track("chat", provider=resolve_name(), model=model_id("chat"),
+                         conversation_id=conversation_id, user_id=user_id) as st:
+            st["inputs"] = [prompt]
+            resp = get_chat_model().invoke(prompt)
+            text = (resp.text if hasattr(resp, "text") else str(resp.content)).strip()
+            st["usage"] = getattr(resp, "usage_metadata", None) or {}
+            st["outputs"] = [text]
         if text.startswith("```"):
             text = text.strip("`").removeprefix("json").strip()
         facts = json.loads(text)

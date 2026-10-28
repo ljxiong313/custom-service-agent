@@ -1,11 +1,14 @@
-"""轻量结构迁移与启动期数据修复。
+"""轻量结构补列与启动期数据修复。
 
-本项目刻意不引入 Alembic：SQLModel 的 create_all 会自动建**新表**，但不会给旧表
-ALTER **新列**，历史上加字段靠删 data/cs_agent.db 重建（只适合空库）。
+历史背景：早期项目没有 Alembic，SQLModel 的 create_all 会自动建**新表**，但不会给旧表
+ALTER **新列**，加字段靠删 data/cs_agent.db 重建（只适合空库）。
 新增列只需在 ADDITIVE_COLUMNS 登记一行，本模块按 PRAGMA table_info 幂等补齐，
 本地已有 3100 行商品/多轮会话的库不用重建，生产也是同一套语句。
 
-只覆盖"加列"这一类安全变更；改类型、改约束、删列仍然需要人工迁移，不要指望这里。
+Alembic 已作为生产迁移体系落地（见 src/backend/alembic.ini 与 migrations/、
+以及 database.migrate_mode 的 auto/alembic 两种模式）：改类型、改约束、删列这类
+create_all 与本模块都覆盖不了的变更，现在写成迁移脚本，不再需要人工重建库。
+补列声明可以继续用（幂等，且 alembic 模式下也会照常执行），但生产口径以迁移为准。
 """
 from __future__ import annotations
 
@@ -15,6 +18,12 @@ from loguru import logger
 # (表, 列, 列定义) —— 只允许带默认值的可空/有默认列，ALTER TABLE ADD COLUMN 才安全
 ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("user", "role", "VARCHAR NOT NULL DEFAULT 'user'"),
+    # 出站失败退避重试：attempts 用 0 兜底（历史行=从未重试），时间/错误文本可空。
+    # next_retry_at 的类型要和 SQLModel 的 UTCDateTime 落到 SQLite 的 DATETIME 一致，
+    # 否则补列出来的库与新库建出来的列类型不同（SQLite 不强制，但排查时会误导）。
+    ("outboxrecord", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("outboxrecord", "next_retry_at", "DATETIME"),
+    ("outboxrecord", "last_error", "VARCHAR"),
 ]
 
 # (子表.外键列, 父表.主键列) —— PRAGMA foreign_keys=ON 之后，历史孤儿行会让删除直接报错，
@@ -28,6 +37,10 @@ ORPHAN_CHECKS: list[tuple[str, str, str, str]] = [
     ("handoffticket", "conversation_id", "conversation", "id"),
     ("externalconversation", "conversation_id", "conversation", "id"),
     ("ingestjob", "file_id", "knowledgefile", "id"),
+    ("toolconfirmrequest", "conversation_id", "conversation", "id"),
+    ("toolconfirmrequest", "user_id", "user", "id"),
+    ("memoryjob", "conversation_id", "conversation", "id"),
+    ("sessionrating", "conversation_id", "conversation", "id"),
 ]
 
 

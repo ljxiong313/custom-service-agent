@@ -178,6 +178,12 @@ def stop_workers() -> None:
     _stop.set()
 
 
+def worker_alive() -> bool:
+    """重建 worker 线程是否在跑（懒启动：从没排过队时确实是 False，只作信息不作就绪条件）。"""
+    with _worker_lock:
+        return bool(_worker_thread and _worker_thread.is_alive())
+
+
 def recover_interrupted_jobs() -> int:
     """进程启动自检：把上次进程留下的 running/queued 判为 interrupted。
 

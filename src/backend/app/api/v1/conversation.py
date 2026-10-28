@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
@@ -10,6 +11,7 @@ from sqlmodel import col, select
 from app.core.security import CurrentUser, DbSession
 from app.db import cascade
 from app.db.models import Conversation, Message, pk
+from app.utils import media_url
 
 router = APIRouter(prefix="/conversations", tags=["conversation"])
 
@@ -83,4 +85,20 @@ def list_messages(conversation_id: int, user: CurrentUser, session: DbSession):
         select(Message).where(Message.conversation_id == conv.id).order_by(col(Message.id))
     ).all()
     return [{"id": m.id, "role": m.role, "content": m.content,
-             "meta_json": m.meta_json, "created_at": m.created_at} for m in rows]
+             "meta_json": _sign_meta(m.meta_json), "created_at": m.created_at} for m in rows]
+
+
+def _sign_meta(meta_json: str | None) -> str | None:
+    """附件链接读取时现签（库里存裸路径），签名过期不影响历史可读。"""
+    if not meta_json:
+        return meta_json
+    try:
+        meta = json.loads(meta_json)
+    except (json.JSONDecodeError, TypeError):
+        return meta_json
+    if isinstance(meta, dict) and isinstance(meta.get("attachments"), list):
+        meta["attachments"] = [
+            {**a, "url": media_url.sign_url(str(a.get("url", "")))} if isinstance(a, dict) else a
+            for a in meta["attachments"]]
+        return json.dumps(meta, ensure_ascii=False)
+    return meta_json

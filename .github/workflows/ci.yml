@@ -1,0 +1,146 @@
+# 质量闸门：离线单测 + 静态检查 + 端到端冒烟（自动起服务）+ 前端类型/单测 + Docker 构建。
+#
+# 为什么端到端也要进 CI：之前 smoke_test.py / platform_smoke.py / run_eval.py 要求
+# "后端已经在 7861 上跑着"，所以从没进过流水线。结果就是 SSE 协议、回调路由、静态文件
+# 鉴权这些只在真 HTTP 栈上暴露的问题，离线单测全绿也照样坏。ci_smoke.py 会在临时端口上
+# 起一个用临时库/临时 Chroma 的隔离实例，跑完自动收掉。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新提交取消还在跑的老流水线
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: 安装依赖（运行 + 开发）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/backend/requirements.txt -r src/backend/requirements-dev.txt
+
+      - name: ruff（120 列，规则 E,F,W,I,B,UP,C4,SIM；刻意不跑 ruff format）
+        run: python -m ruff check src eval
+
+      - name: mypy
+        run: python -m mypy
+
+      - name: 离线单测（临时 SQLite + 临时 Chroma，不打模型）
+        run: python -m pytest -q
+        env:
+          PYTHONIOENCODING: utf-8
+
+      - name: 端到端冒烟 + 评测（自动拉起隔离服务，无模型 key 走降级路径）
+        working-directory: src/backend
+        run: python scripts/ci_smoke.py
+        env:
+          PYTHONIOENCODING: utf-8
+
+      - name: 运维脚本自检（备份/恢复/对账/重建脚本必须能 import）
+        working-directory: src/backend
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src/backend
+          CS_CONFIG: config.simple.yaml
+        run: |
+          python -c "import importlib; [importlib.import_module(f'scripts.{m}') for m in ('backup_data','restore_data','verify_restore','reindex_vectors','reingest_files','ci_smoke')]"
+          python scripts/backup_data.py --dry-run
+
+  # 真模型链路只在 main 上跑，且需要仓库 secret；没有它这一步跳过而不是失败
+  backend-with-model:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.HAS_MODEL_KEY == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r src/backend/requirements.txt -r src/backend/requirements-dev.txt
+      - name: 写入 CI 配置（api_key 来自 secret，绝不回显）
+        working-directory: src/backend
+        env:
+          CS_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          base = pathlib.Path("config.simple.yaml").read_text(encoding="utf-8")
+          ci = base.replace("api_key: \"\"", f"api_key: {os.environ['CS_API_KEY']}", 1)
+          pathlib.Path("config.ci.yaml").write_text(ci, encoding="utf-8")
+          print("config.ci.yaml 已生成（含 key，长度 %d）" % len(os.environ["CS_API_KEY"]))
+          PY
+      - name: 带真模型的评测（向量检索 + 对话质量断言不再 SKIP）
+        working-directory: src/backend
+        env:
+          CS_CONFIG: config.ci.yaml
+          PYTHONIOENCODING: utf-8
+        run: python scripts/ci_smoke.py
+      - name: 清理含密钥的临时配置
+        if: always()
+        working-directory: src/backend
+        run: rm -f config.ci.yaml
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: src/frontend/package-lock.json
+      - run: npm ci
+        working-directory: src/frontend
+      - run: npm run typecheck
+        working-directory: src/frontend
+      - run: npm run test
+        working-directory: src/frontend
+      - run: npm run build
+        working-directory: src/frontend
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: src/frontend/dist
+          retention-days: 7
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建后端镜像
+        run: docker build -t cs-agent:ci .
+      - name: 起容器并等 /ready 通过
+        run: |
+          docker run -d --name cs-agent-ci -p 7861:7861 \
+            -e CS_CONFIG=/app/config.simple.yaml cs-agent:ci
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:7861/ready >/dev/null; then echo "ready after ${i}s"; break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:7861/health
+          curl -fsS http://127.0.0.1:7861/ready
+      - name: 冒烟脚本打容器（镜像里的依赖是否真的齐，只有跑起来才知道）
+        run: python -m pip install httpx pyyaml && PYTHONIOENCODING=utf-8 python src/backend/scripts/smoke_test.py
+      - name: 失败时留日志
+        if: failure()
+        run: docker logs cs-agent-ci --tail 200
+      - name: 清理
+        if: always()
+        run: docker rm -f cs-agent-ci

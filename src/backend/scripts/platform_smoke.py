@@ -4,12 +4,13 @@
 说明：全程 mock 模式，无需任何平台资质与真实模型 key
 （普通消息会因模型 401 降级，但影子会话建档发生在模型调用之前，可独立验证）。
 """
+import os
 import sys
 import time
 
 import httpx
 
-BASE = "http://127.0.0.1:7861"
+BASE = os.environ.get("CS_BASE_URL", "http://127.0.0.1:7861")
 CB = f"{BASE}/api/platform"
 ok = fail = 0
 

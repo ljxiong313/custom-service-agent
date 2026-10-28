@@ -15,6 +15,7 @@ const router = createRouter({
         { path: 'chat/:id', name: 'chat-detail', component: () => import('@/pages/chat/ChatView.vue') },
         { path: 'knowledge', name: 'knowledge', component: () => import('@/pages/console/Knowledge.vue') },
         { path: 'handoff', name: 'handoff', component: () => import('@/pages/console/Handoff.vue') },
+        { path: 'dashboard', name: 'dashboard', component: () => import('@/pages/console/Dashboard.vue') },
         { path: 'memory', name: 'memory', component: () => import('@/pages/console/Memory.vue') },
         { path: 'mcp', name: 'mcp', component: () => import('@/pages/console/Mcp.vue') },
         { path: 'settings', name: 'settings', component: () => import('@/pages/console/Settings.vue') },

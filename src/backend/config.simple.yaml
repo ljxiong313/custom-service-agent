@@ -10,15 +10,75 @@
 server:
   host: 0.0.0.0
   port: 7861          # 与 AgentChat(7860) 错开，便于同机并存开发
+  # 运行形态：dev（默认，宽松）/ production（启用一批硬闸：默认密钥、回调不验签、
+  # 内网 MCP 端点、自助注册等会被拒绝启动或拒绝请求；口径见 app/startup_check.py）
+  env: dev
+  # 前面有反代/LB 且它可靠地写 X-Forwarded-For 时才置 true：限流的 IP 键会取 XFF 首跳。
+  # 直连暴露服务时保持 false，否则任何人伪造一个头就能绕过限流。
+  trust_proxy_headers: false
+  # 买家在平台里点开的附件链接要能到达本站，必须知道公网可达地址（末尾不带 /）
+  public_base_url: ""
+  # 跨域白名单。留空列表 [] = 只允许同源部署（生产推荐：前端与 /api 同源反代）；
+  # 不写这个键 = 用内置开发白名单 localhost:8091。切勿在生产填 *。
+  # cors_origins: ["https://cs.example.com"]
+  # 进程数（run.py --workers / CS_SERVER_WORKERS 可覆盖）。SQLite 是单写者，
+  # 建议保持 1；换 Postgres/MySQL 后再按 CPU 核数放大。多副本语义见 docs/运维手册.md。
+  workers: 1
+  # 由后端直接托管前端构建产物（同源部署，免 CORS、免第二个静态站点）。
+  # 关掉时前端自己跑 vite dev 或另行托管。
+  serve_frontend: false
+  frontend_dist: ""        # 留空 = src/backend/web；容器镜像里是 /app/web
 
 database:
   # 默认 SQLite，零依赖即可跑通；生产可切 mysql+pymysql://user:pwd@host/db
   url: sqlite:///./data/cs_agent.db
+  # 建库方式：auto（默认）= 启动时 create_all 补新表 + db/migrate.py 补列，结构改动不用重建库，
+  # 开发体验最好；alembic = 启动时只跑 `alembic upgrade head`（migrations/versions），**跳过
+  # create_all**，补列与孤儿清理照常执行。
+  # 两种模式的区别只有一处：忘了写迁移时，auto 会被 create_all 悄悄把表补上，alembic 不会——
+  # 缺的表第一次用到就报 no such table，所以生产必须配 alembic，CI 用 alembic check /
+  # tests/test_migrations.py 的空 diff 断言把问题拦在提交前。
+  # 何时切 alembic：生产/预发布部署一律 alembic（镜像里要带上 alembic.ini 与 migrations/）；
+  # 存量库第一次切过来时先打版本再改配置：py -m alembic -c src/backend/alembic.ini stamp 0001，
+  # 否则 upgrade 会撞 "table xxx already exists"。开发本机保持 auto 即可。
+  # 取值只能是 auto / alembic：填错（含拼写错误）直接拒绝启动，不静默回落到 auto。
+  # 想在容器里注入就在自己的配置文件写 migrate_mode: ${CS_DB_MIGRATE_MODE:-auto}。
+  migrate_mode: auto
 
 security:
-  jwt_secret: "dev-secret-change-me"   # 生产必须覆盖
+  jwt_secret: "dev-secret-change-me"   # 生产必须覆盖（可用 ${CS_JWT_SECRET} 注入环境变量）
   jwt_algorithm: HS256
   jwt_expire_minutes: 10080            # 7 天
+  # 媒体链接签名密钥：留空则复用 jwt_secret。换这个密钥只会让旧附件链接失效，不影响登录。
+  media_url_secret: ""
+  media_url_ttl_seconds: 86400         # /api/files 签名链接有效期（默认 24h）
+  # Prometheus 抓取端点 /metrics 的访问令牌。留空时：非生产开放、生产直接 403。
+  # 回访链接的签名密钥；留空回落 jwt_secret（单独配一个更好：泄漏面不叠加）
+  feedback_secret: ""
+  metrics_token: ""
+  # 令牌桶限流（进程内计数；多副本部署请换网关/Redis 层限流）。
+  # 只作用于写路径：对话、代答、登录注册、知识库上传、平台与企微回调。
+  rate_limit:
+    enabled: true
+    default: { per_minute: 120, burst: 40 }
+    rules:
+      - path_prefix: /api/v1/auth/login      # 防爆破：按 token/IP 每分钟 5 次
+        per_minute: 5
+        burst: 5
+      - path_prefix: /api/v1/auth/register
+        per_minute: 5
+        burst: 5
+      - path_prefix: /api/v1/chat            # 每个买家会话的发送频率
+        per_minute: 30
+        burst: 10
+      - path_prefix: /api/platform           # 平台回调重推很常见，给高一点但要有顶
+        per_minute: 600
+        burst: 120
+      - path_prefix: /api/wecom
+        per_minute: 300
+        burst: 60
+  # 生产默认关闭自助注册（空库例外，便于首次部署自举 admin）；需要开放时显式置 true
+  # allow_registration: true
 
 # -----------------------------------------------------------------------------
 # 多模型配置：全部走 OpenAI 兼容协议（ChatOpenAI），
@@ -46,6 +106,36 @@ default_model: dashscope
 llm:
   request_timeout_seconds: 60
   max_retries: 2
+  # 备用模型链：default_model 失败（且还没吐出任何字）时按顺序换 provider 重试。
+  # 每个名字必须是 multi_models 下的键；留空 = 只用默认模型（单点，套餐类 key 限流即失败）。
+  fallback: []
+  # 成本估算价目表（单位：元/1000 token）。没配的 provider/model 用量流水里 cost_est 为 null，
+  # 报表显示"未配价"而不是 0 元。按你的实际合同价填，示例数值仅供格式参考。
+  pricing: {}
+  #   dashscope:
+  #     qwen-plus: { input_per_1k: 0.0008, output_per_1k: 0.002 }
+  #     text-embedding-v4: { input_per_1k: 0.0005, output_per_1k: 0 }
+  #     default: { input_per_1k: 0.001, output_per_1k: 0.002 }
+
+# -----------------------------------------------------------------------------
+# Agent 人设与转人工口径（B3-10）：换商家/换语气只改这里，不动代码。
+# 全部留空即用内置默认（persona.py 的 DEFAULT_*），行为与硬编码时代一致。
+#   name/scene/tone/language  进入 system prompt 的自我介绍与风格约束
+#   max_reply_chars           单次回复字数上限（模型遵循度比"简短一点"这种话高得多）
+#   extra_rules               追加到行为准则的商家专属规则（有序编号接着排）
+#   handoff_keywords          触发"是否转人工"询问的正则（先于模型判定）
+#   confirm_affirm/confirm_negate  确认询问后买家回复的肯定/否定判定（行首匹配）
+#   handoff_ask/handoff_queued     两句对外话术
+# 写错正则会退回内置口径并告警，不会让对话整轮崩掉。
+# -----------------------------------------------------------------------------
+agent:
+  name: 小 U
+  scene: 电商场景的专业在线客服助手
+  tone: 简洁、友好、口语化
+  max_reply_chars: 300
+  language: 中文
+  extra_rules: []
+  # extra_rules: ["禁止承诺具体到货时间", "涉及退款金额必须先复述确认"]
 
 # -----------------------------------------------------------------------------
 # 记忆系统参数
@@ -60,6 +150,11 @@ memory:
 # 未结工单强制关闭（中断转人工），后续入站拒收。sweep 为后台扫描周期。
 # -----------------------------------------------------------------------------
 session:
+  # B3-13 满意度回访：结单时是否在告别语后附一条带签名的评价链接（免登录、只授权本会话一票）。
+  # 关闭时（默认）不产生任何对外链接；rate_survey_text 里的 {url} 会被换成绝对签名链接。
+  rate_survey_enabled: false
+  rate_survey_days: 7
+  # rate_survey_text: "本次服务还满意吗？点此评价（{url}），1-5 分，10 秒钟就好。"
   idle_seconds: 300
   close_after_seconds: 60
   sweep_interval_seconds: 30
@@ -74,15 +169,30 @@ rag:
   top_k: 5                 # 最终送给模型/展示的结果条数
   chroma_path: ""          # 留空 = data/chroma/
   ingest_workers: 2        # 入库/重建并发线程数（B1-2）。开太大只是同时打 embedding 限流
+  # BM25 索引持久化（B1-9）。关掉=回到"每次检索现取现建"（千级切片几百毫秒、万级秒级，
+  # 实测数字见 scripts/bench_rag.py）；开启时按"语料版本标记"自动判过期，结果与全量重建一致。
+  bm25_persist: true
+  bm25_index_path: ""      # 留空 = data/bm25/knowledge.pkl.gz（相对路径按后端根解析）
+  # 单次 embedding 请求条数。默认 10；超过 20 会被夹紧到 20 并在首次使用时告警一次
+  #（百炼兼容模式硬上限 20，写大了只会让整批请求报 "batch size is invalid"）。
+  embedding_batch_size: 10
 
 # -----------------------------------------------------------------------------
 # MCP（P4）。stdio 传输会在本机拉起一个进程，等于把"执行任意命令"交给了
 # 能在管理页填表的人，所以命令名必须在白名单内（比较时忽略大小写、目录与 .exe）。
 # 留空或删掉本节 = 使用代码内置白名单；确实需要放行别的程序时在这里追加，
 # 不要放宽到 shell。
+# B3-6 起白名单不再等于放行：还会拒绝解释器的内联代码开关（python -c / -m、
+# node -e / --eval …）与越界的脚本路径（必须落在 allowed_script_roots 内）。
 # -----------------------------------------------------------------------------
 mcp:
   allowed_commands: [python, python3, py, node, npx, uv, uvx]
+  # 脚本允许存放的目录（相对路径按后端根解析）；留空 = 后端根目录
+  # allowed_script_roots: ["./scripts"]
+  # npx/uvx/uv 每次运行都拉包执行 = 任意代码。未配置时：dev 放行、production 拒绝。
+  # allow_package_runners: true
+  # sse/http 端点：生产默认拒绝内网/链路本地地址（SSRF 面）；需要接内网服务时置 true
+  # allow_private_urls: true
 
 # -----------------------------------------------------------------------------
 # 企业微信（P3）。mock=true 时不外呼：卡片记入内存 outbox，工作台可查，
@@ -104,8 +214,14 @@ wecom:
 # 回调 URL 统一为 https://<你的域名>/api/platform/{platform}/callback
 # mock=true（默认）：验签放行、回复进内存外发箱，无需平台资质即可演示全链路。
 # 各字段口径、待核对(★)项与填法详见 docs/平台接入.md —— 拿到凭证后逐项替换即可。
+# 真实外呼（mock=false）必须同时配 server.public_base_url，否则买家拿到的附件链接是
+# 相对路径打不开：媒体外发会记 skipped，正文降级成"附件需在客服工作台查看"的提示
+# （生产形态下启动自检会把它当致命项，见 app/startup_check.py）。
 # -----------------------------------------------------------------------------
 platforms:
+  # 出站失败退避重试的扫描周期（秒）。失败行按 15s/60s/240s 三档重投，
+  # 这里只决定"多久看一次队列"，比最短退避小太多就是空转查库。
+  retry_interval_seconds: 15
   taobao:
     enabled: true
     mock: true

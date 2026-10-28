@@ -75,6 +75,22 @@ def is_configured(name: str | None = None) -> bool:
         return False
 
 
+def capability_ready(kind: str, name: str | None = None) -> bool:
+    """某类能力是否真能用：既要 api_key，还要配了对应的模型名。
+
+    单独区分出来是因为现场最常见的坑不是"没 key"，而是**套餐类 key 只放行对话模型**：
+    chat 能跑但 embedding 403/404，检索静默降级 BM25。设置页和冒烟脚本都需要
+    "向量化到底可不可用"这个信号，而不是笼统的 model_ready。
+    """
+    try:
+        conf = _model_config(name)
+    except ModelNotConfiguredError:
+        return False
+    key = {"chat": "chat_model", "embedding": "embedding_model",
+           "vision": "vl_model", "rerank": "rerank_model"}[kind]
+    return bool(conf.get("api_key")) and bool(conf.get(key))
+
+
 def get_chat_model(name: str | None = None):
     from langchain_openai import ChatOpenAI
 
@@ -87,6 +103,51 @@ def get_chat_model(name: str | None = None):
         streaming=True,
         **_client_kwargs(),
     )
+
+
+def resolve_name(name: str | None = None) -> str:
+    """配置名（multi_models 下的键）；未指定时取 default_model。"""
+    return str(name or get_settings().get_dotted("default_model", "dashscope"))
+
+
+def model_id(kind: str = "chat", name: str | None = None) -> str:
+    """给计量用：某个能力实际使用的模型名（chat/embedding/vision/rerank）。"""
+    key = {"chat": "chat_model", "embedding": "embedding_model",
+           "vision": "vl_model", "rerank": "rerank_model"}[kind]
+    fallback = {"chat": "qwen-plus", "embedding": "text-embedding-v4",
+                "vision": "", "rerank": "gte-rerank-v2"}[kind]
+    try:
+        conf = _model_config(name)
+    except ModelNotConfiguredError:
+        conf = {}
+    return str(conf.get(key) or fallback)
+
+
+def chat_chain() -> list[str]:
+    """对话模型的尝试顺序：default_model 在前，llm.fallback 依次追加。
+
+    单 provider 是智能体产品的单点故障：套餐类 key 触发限流或上游 5xx 时，
+    正在等回复的买家只能看到错误。备用链让 runner 在同一轮里换一个 provider 再试，
+    并把失败记进用量流水（cs_llm_not_ok_total），运维才看得到"这个月在降级跑"。
+    """
+    s = get_settings()
+    names = [resolve_name()]
+    for extra in (s.get_dotted("llm.fallback", None) or []):
+        n = str(extra).strip()
+        if n and n not in names:
+            names.append(n)
+    return names
+
+
+def iter_chat_models(except_name: str | None = None):
+    """按 chat_chain 顺序产出 (provider 名, 模型实例)，跳过未配置的与已试过的。"""
+    for n in chat_chain():
+        if n == except_name:
+            continue
+        try:
+            yield n, get_chat_model(n)
+        except ModelNotConfiguredError:
+            logger.warning("备用模型 {} 未配置 api_key，跳过", n)
 
 
 @lru_cache

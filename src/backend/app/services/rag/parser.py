@@ -106,18 +106,25 @@ def _parse_docx(path: Path) -> ParsedDoc:
 
 def _parse_image(path: Path) -> ParsedDoc:
     """图片 → 视觉模型生成描述（image2text）。无 key 时抛错由上层记为 failed。"""
-    from app.core.models.manager import get_vision_model
+    from app.core.models.manager import get_vision_model, model_id, resolve_name
+    from app.services import usage
 
     model = get_vision_model()
     import base64
 
     from langchain_core.messages import HumanMessage
     b64 = base64.b64encode(path.read_bytes()).decode()
+    prompt_text = "请提取图中全部商品信息与文字内容（名称/价格/规格/卖点），按 Markdown 输出。"
     msg = HumanMessage(content=[
-        {"type": "text", "text": "请提取图中全部商品信息与文字内容（名称/价格/规格/卖点），按 Markdown 输出。"},
+        {"type": "text", "text": prompt_text},
         {"type": "image_url", "image_url": {"url": f"data:{_mime(path)};base64,{b64}"}},
     ])
-    resp = model.invoke([msg])
+    # 图片字节不进计量（base64 串会估出天文数字的 token），只按提示词估输入
+    with usage.track("vision", provider=resolve_name(), model=model_id("vision")) as st:
+        st["inputs"] = [prompt_text]
+        resp = model.invoke([msg])
+        st["usage"] = getattr(resp, "usage_metadata", None) or {}
+        st["outputs"] = [resp.text]
     return ParsedDoc(text=f"[图片识别: {path.name}]\n{resp.text}")
 
 

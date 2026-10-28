@@ -1,5 +1,6 @@
-# 构建上下文是仓库根目录：只让镜像拿到后端源码，其余一概不进层。
-# 关键是 config.local.yaml（明文 api_key）和 data/（数据库 + 备份快照）不能进镜像。
+# 构建上下文是仓库根目录。关键红线：config.local.yaml（明文 api_key）与 data/
+# （数据库、上传文件、备份快照）绝不进镜像层——备份快照里也带着同名配置文件。
+# 其余被排除的项都是"容器里会重新生成"的东西，排掉只为让层更小更稳。
 **/__pycache__/
 *.pyc
 .git/
@@ -12,7 +13,9 @@ src/backend/config.local.yaml
 src/backend/data/
 src/backend/uvicorn_dev.log
 
-src/frontend/
+# 前端源码要进镜像构建阶段（node 打包），但依赖与产物在容器里重装/重打
+src/frontend/node_modules/
+src/frontend/dist/
 docs/
 eval/
 pyproject.toml

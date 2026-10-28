@@ -47,19 +47,24 @@ def _post_with_retry(url: str, *, headers: dict, payload: dict) -> dict:
 def rerank(query: str, documents: list[str], top_n: int) -> list[tuple[int, float]] | None:
     """返回 [(原始下标, 相关性分数)] 降序；None 表示跳过重排。"""
     try:
-        from app.core.models.manager import get_rerank_config
+        from app.core.models.manager import get_rerank_config, resolve_name
+        from app.services import usage
 
         conf = get_rerank_config()
         if not documents:
             return None
-        data = _post_with_retry(
-            conf["base_url"],
-            headers={"Authorization": f"Bearer {conf['api_key']}",
-                     "Content-Type": "application/json"},
-            payload={"model": conf["model"],
-                     "input": {"query": query, "documents": documents},
-                     "parameters": {"return_documents": False,
-                                    "top_n": min(top_n, len(documents))}})
+        # 只包外呼那一次：请求失败照常上抛给外层 except，保持"降级返回 None"的行为不变，
+        # 但流水里会留下一条 status=error——运维才看得到重排一直在跳过。
+        with usage.track("rerank", provider=resolve_name(), model=conf["model"]) as st:
+            st["inputs"] = [query, *documents]
+            data = _post_with_retry(
+                conf["base_url"],
+                headers={"Authorization": f"Bearer {conf['api_key']}",
+                         "Content-Type": "application/json"},
+                payload={"model": conf["model"],
+                         "input": {"query": query, "documents": documents},
+                         "parameters": {"return_documents": False,
+                                        "top_n": min(top_n, len(documents))}})
         results = data["output"]["results"]
         return [(r["index"], float(r["relevance_score"])) for r in results]
     except Exception as e:

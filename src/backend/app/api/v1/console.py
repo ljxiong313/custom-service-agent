@@ -4,9 +4,8 @@
 「我」的两种来源（Agent 自动回复 / 运营手动代答）只记在 meta.from 供运营侧区分，
 买家/客户侧不可感知。
 
-权限口径：这里的跨用户只读+代答是运营台的核心能力，不是 IDOR 疏漏，所以任意登录
-用户均可用；B1-7 引入的 role 字段只收紧"会改动全局语料/本机进程/他人账号"的接口
-（知识库写、MCP 增删改、用户角色、删除会话文件），不收紧这里的日常代答。
+权限口径（B3-6 收紧）：跨用户只读+代答是运营台的核心能力，但只对 staff/admin 开放；
+普通登录用户退化为"只看/只回自己的会话"。归属判定统一走 security.can_access_conversation。
 """
 from __future__ import annotations
 
@@ -20,10 +19,16 @@ from pydantic import BaseModel, Field
 from sqlmodel import col, select
 
 from app.config import BACKEND_ROOT
-from app.core.security import CurrentUser, DbSession
+from app.core.security import (
+    CurrentUser,
+    DbSession,
+    can_access_conversation,
+    is_staff,
+)
 from app.db.models import Conversation, ExternalConversation, HandoffTicket, Message, User, pk
 from app.services.platforms.inbound import deliver_media, deliver_notice
 from app.services.wecom.handoff import staff_reply
+from app.utils import media_url
 
 router = APIRouter(prefix="/console", tags=["console"])
 
@@ -38,12 +43,32 @@ def _get_conv(session, conv_id: int) -> Conversation:
     return conv
 
 
+def _owned_conv(session, conv_id: int, user: User) -> Conversation:
+    """带归属校验的取会话：非客服访问他人会话时按"不存在"处理，不泄漏他人会话是否存在。"""
+    conv = _get_conv(session, conv_id)
+    if not can_access_conversation(user, conv):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "会话不存在")
+    return conv
+
+
+def _sign_attachments(meta: dict | None) -> dict | None:
+    """读取消息时给附件链接现签（库里存的是裸路径）。"""
+    if not meta:
+        return meta
+    atts = meta.get("attachments")
+    if isinstance(atts, list):
+        meta["attachments"] = [{**a, "url": media_url.sign_url(str(a.get("url", "")))}
+                               if isinstance(a, dict) else a for a in atts]
+    return meta
+
+
 @router.get("/conversations")
 def list_conversations(user: CurrentUser, session: DbSession, limit: int = 100):
-    """全渠道买家会话列表（平台 + 网页），按最近更新排序。"""
-    convs = list(session.exec(
-        select(Conversation).order_by(col(Conversation.updated_at).desc()).limit(limit)
-    ).all())
+    """全渠道买家会话列表（平台 + 网页），按最近更新排序；非客服只看自己的会话。"""
+    stmt = select(Conversation).order_by(col(Conversation.updated_at).desc())
+    if not is_staff(user):
+        stmt = stmt.where(Conversation.user_id == pk(user))
+    convs = list(session.exec(stmt.limit(limit)).all())
     exts = {e.conversation_id: e for e in session.exec(select(ExternalConversation)).all()}
 
     items = []
@@ -83,19 +108,24 @@ class ReplyBody(BaseModel):
 @router.post("/conversations/{conv_id}/reply")
 def operator_reply(conv_id: int, body: ReplyBody, user: CurrentUser, session: DbSession):
     """运营以「我」的身份手动回复：客户无感知人工/AI 差异；已建工单则走工单回路。"""
-    conv = _get_conv(session, conv_id)
+    conv = _owned_conv(session, conv_id, user)
     if conv.status == "closed":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "该会话已结束，无法回复")
     text = body.text.strip()
     if not text and not body.attachments:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "回复内容不能为空")
 
+    # 前端回传的是上传接口给的（已签名）链接，落库前统一成裸路径：
+    # 签名只在读取时现算，存进库的过期时间戳会变成死链。
+    stored = [{**a.model_dump(), "url": media_url.bare_url(a.url)} for a in body.attachments]
     meta: dict[str, Any] = {"from": "human_operator", "staff": user.username}
-    if body.attachments:
-        meta["attachments"] = [a.model_dump() for a in body.attachments]
+    if stored:
+        meta["attachments"] = stored
     outbound = text or "（图片/文件）"
-    if body.attachments:
-        outbound += "\n" + "\n".join(f"[附件] {a.name}: {a.url}" for a in body.attachments)
+    if stored:
+        # 买家在平台客户端里点不开相对路径，外发正文用"绝对地址 + 签名"的临时链接
+        outbound += "\n" + "\n".join(
+            f"[附件] {a['name']}: {media_url.absolute_url(str(a['url']))}" for a in stored)
 
     # 有未结工单：复用 P3 客服回复回路（落库+进入 human+平台外发），并附加媒体
     ticket = session.exec(select(HandoffTicket).where(
@@ -103,7 +133,7 @@ def operator_reply(conv_id: int, body: ReplyBody, user: CurrentUser, session: Db
         col(HandoffTicket.status).in_(("open", "handling")))).first()
     if ticket:
         msg = staff_reply(session, ticket, outbound, staff=user.username)
-        if body.attachments:
+        if stored:
             msg.meta_json = json.dumps({**(json.loads(msg.meta_json or "{}")),
                                         "attachments": meta["attachments"]}, ensure_ascii=False)
             session.add(msg)
@@ -124,35 +154,41 @@ def operator_reply(conv_id: int, body: ReplyBody, user: CurrentUser, session: Db
     session.commit()
     session.refresh(msg)
     deliver_notice(conv_id, outbound)   # 平台会话外发；网页会话返回 False 静默
-    if body.attachments:
+    if stored:
         deliver_media(conv_id, meta["attachments"])
     return {"message_id": msg.id, "via": "direct"}
 
 
 @router.get("/conversations/{conv_id}/messages")
 def conversation_messages(conv_id: int, user: CurrentUser, session: DbSession):
-    """跨渠道完整消息历史（运营侧视角，meta.from 标注回复来源）。"""
-    _get_conv(session, conv_id)
+    """跨渠道完整消息历史（运营侧视角，meta.from 标注回复来源）；附件链接读取时现签。"""
+    _owned_conv(session, conv_id, user)
     msgs = list(session.exec(select(Message).where(
         Message.conversation_id == conv_id).order_by(Message.id)).all())  # type: ignore[arg-type]
     return [{"id": m.id, "role": m.role, "content": m.content,
-             "meta": json.loads(m.meta_json) if m.meta_json else None,
+             "meta": _sign_attachments(json.loads(m.meta_json) if m.meta_json else None),
              "created_at": m.created_at} for m in msgs]
 
 
 @router.post("/media")
 async def upload_media(file: UploadFile, user: CurrentUser):
-    """运营输入框粘贴图片/发送文件：存 data/uploads/media，经 /api/files 访问。"""
+    """运营输入框粘贴图片/发送文件：存 data/uploads/media，经签名 /api/files 访问。"""
     data = await file.read()
     if not data:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "空文件")
     if len(data) > MAX_MEDIA_BYTES:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "文件超过 10MB")
-    ext = (file.filename or "").rsplit(".", 1)[-1].lower()[:10] if "." in (file.filename or "") else "bin"
-    # 文件名白名单化：只保留字母数字与后缀，杜绝路径穿越
-    fname = f"{uuid.uuid4().hex[:16]}.{ext}" if ext != "bin" else uuid.uuid4().hex
+    ext = (file.filename or "").rsplit(".", 1)[-1].lower()[:10] if "." in (file.filename or "") else ""
+    # 上传类型白名单：svg/html/js 这类能在浏览器里执行脚本的后缀一律拒绝——
+    # 这些文件会以本站点身份被 /api/files serve，等于给自己挂一个存储型 XSS。
+    if ext not in media_url.ALLOWED_MEDIA_EXT:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "文件缺少可识别的扩展名，或类型不支持；只允许 "
+                            f"{'、'.join(sorted(media_url.ALLOWED_MEDIA_EXT))}")
+    # 文件名白名单化：uuid + 白名单后缀，杜绝路径穿越与脚本后缀
+    fname = f"{uuid.uuid4().hex[:16]}.{ext}"
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     (MEDIA_DIR / fname).write_bytes(data)
     kind = "image" if (file.content_type or "").startswith("image/") else "file"
-    return {"url": f"/api/files/{fname}", "name": file.filename or fname,
+    return {"url": media_url.sign_url(f"/api/files/{fname}"), "name": file.filename or fname,
             "type": kind, "size": len(data)}

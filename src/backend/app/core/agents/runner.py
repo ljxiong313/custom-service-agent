@@ -13,34 +13,38 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
-import re
 from collections.abc import AsyncIterator
+from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from loguru import logger
 from sqlmodel import Session
 
-from app.core.agents.persona import build_system_prompt
+from app.core.agents.persona import (
+    build_system_prompt,
+    confirm_affirm,
+    handoff_keywords,
+    persona,
+)
 from app.core.agents.tools import build_tools_async
 from app.core.agents.tools.handoff_tools import current_handoff_ctx
 from app.core.agents.tools.rag_tools import citation_collector
-from app.core.models.manager import ModelNotConfiguredError, get_chat_model
+from app.core.models.manager import (
+    ModelNotConfiguredError,
+    chat_chain,
+    get_chat_model,
+    is_configured,
+)
+from app.core.models.manager import model_id as manager_model_id
 from app.db.models import Conversation, Message, User, pk
 from app.db.session import engine
+from app.services import usage
 from app.services.memory.short import ShortTermMemory
 
 MAX_TOOL_ROUNDS = 5
 
-# P3 显式关键词触发（优先于 LLM 判定）；P8 起不再直接建单，而是进入确认询问态
-HANDOFF_KEYWORDS = re.compile(r"(转人工|人工客服|找个人|真人客服|投诉)")
-# P8 确认式转人工：awaiting_confirm 态下买家的肯定/否定回复判定（行首匹配即可）
-CONFIRM_AFFIRM = re.compile(
-    r"^\s*(嗯+|好(的|呀|啊)?|是(的|呀|吧)?|要(的)?|需要|行|可以|确认|转吧|麻烦你|请转|ok|okay|yes)",
-    re.IGNORECASE)
-CONFIRM_NEGATE = re.compile(r"^\s*(不|不用|不要|算了|暂时|没|no)", re.IGNORECASE)
-
-HANDOFF_ASK = "是否需要为您转接人工客服？回复「是」立即为您转接，回复「否」可继续与智能助手沟通。"
-HANDOFF_QUEUED = "已为您联系人工客服，请稍候…"
+# 转人工的触发词/肯定否定词与提示文案都在 `agent` 配置节里（persona.py 负责读取与
+# 正则兜底）：不同商家要转人工的说法、买家回复的措辞都不一样，改配置不该改代码。
 
 
 def _now() -> datetime.datetime:
@@ -82,6 +86,68 @@ def _persist_assistant_message(conv_id: int, content: str, meta: dict, user_text
         return pk(msg)
 
 
+async def _model_rounds(bound, tools_by_name: dict, messages: list, tool_trace: list[dict], *,
+                        conv_id: int, uid: int, interactive: bool,
+                        provider: str, model_name: str) -> AsyncIterator[tuple[str, Any]]:
+    """模型+工具循环（最多 MAX_TOOL_ROUNDS 轮），逐事件产出给调用方转发。
+
+    文本增量以内部事件 `("__text__", 文本)` 上抛，由 run_turn 汇总落库——这样备用模型
+    换环时 run_turn 能判断"是不是一个字都还没发出去"，只有没发过才允许重跑。
+    每轮都记一条用量流水（含 token 与耗时），中断/失败也记。
+    """
+    for _round in range(MAX_TOOL_ROUNDS):
+        acc = None
+        parts: list[str] = []
+        with usage.track("chat", provider=provider, model=model_name,
+                         conversation_id=conv_id, user_id=uid) as st:
+            async for chunk in bound.astream(messages):
+                acc = chunk if acc is None else acc + chunk
+                # 工具调用参数流式拼半截时 text 增量仍可能是思考文本，照常下发
+                if isinstance(chunk.content, str) and chunk.content:
+                    parts.append(chunk.content)
+                    yield "__text__", chunk.content
+            st["usage"] = getattr(acc, "usage_metadata", None) or {}
+            st["outputs"] = parts
+        if acc is None:
+            break
+        messages.append(acc)
+        calls = getattr(acc, "tool_calls", None) or []
+        if not calls:
+            break  # 最终回答已流式输出
+        for call in calls:
+            yield "tool", {"name": call["name"], "args": call["args"], "status": "start"}
+            # ---- P4: MCP 需确认工具 → 网页端挂起等确认卡片；平台端直接拒绝 ----
+            from app.services.mcp.manager import is_confirm_required
+
+            if is_confirm_required(call["name"]) and interactive:
+                from app.services.mcp.confirm import create_request, wait_decision
+
+                rid = create_request(conv_id, uid, call["name"], call["args"])
+                yield "confirm_request", {"request_id": rid, "name": call["name"],
+                                          "args": call["args"]}
+                approved = await wait_decision(rid)
+                out = (await _run_tool(tools_by_name, call) if approved
+                       else "用户拒绝了该操作。")
+            elif is_confirm_required(call["name"]):
+                out = "该操作需要用户在网页端确认，平台渠道已取消。"
+            else:
+                out = await _run_tool(tools_by_name, call)
+            yield "tool", {"name": call["name"], "args": call["args"],
+                           "status": "end", "output": str(out)[:400]}
+            tool_trace.append({"name": call["name"], "args": call["args"]})
+            # P3: request_handoff 成功 → 状态机切换并通知调用方
+            if call["name"] == "request_handoff":
+                try:
+                    from app.services.wecom.handoff import apply_handoff_from_tool
+
+                    info = apply_handoff_from_tool(conv_id, out)
+                    if info:
+                        yield "handoff", info
+                except Exception:
+                    logger.exception("handoff 状态更新失败")
+            messages.append(ToolMessage(tool_call_id=call["id"], content=str(out)))
+
+
 async def run_turn(session: Session, conv: Conversation, user: User,
                    text: str, *, interactive: bool = True) -> AsyncIterator[tuple[str, dict]]:
     """执行一轮对话：入库用户消息 → 状态机判定 → 模型+工具循环 → 落库回答。"""
@@ -108,10 +174,10 @@ async def run_turn(session: Session, conv: Conversation, user: User,
 
     # ---- P8 确认式转人工：awaiting_confirm 态下按买家回复裁决 ----
     if conv.handoff_status == "awaiting_confirm":
-        if CONFIRM_AFFIRM.match(text):
+        if confirm_affirm().match(text):
             from app.services.wecom.handoff import create_ticket
 
-            tip, status, ticket_id = HANDOFF_QUEUED, "pending_human", None
+            tip, status, ticket_id = persona().handoff_queued, "pending_human", None
             try:
                 ticket = create_ticket(session, conv, user, "客户确认转人工")
                 ticket_id = ticket.id
@@ -138,9 +204,9 @@ async def run_turn(session: Session, conv: Conversation, user: User,
         session.commit()
 
     # ---- P3 关键词显式触发（先于一切 LLM 判定）→ P8 进入确认询问态，不直接建单 ----
-    if conv.handoff_status == "bot" and HANDOFF_KEYWORDS.search(text):
+    if conv.handoff_status == "bot" and handoff_keywords().search(text):
         conv.handoff_status = "awaiting_confirm"
-        note = Message(conversation_id=conv_id, role="assistant", content=HANDOFF_ASK,
+        note = Message(conversation_id=conv_id, role="assistant", content=persona().handoff_ask,
                        meta_json=json.dumps({"from": "system_handoff_ask"}, ensure_ascii=False))
         session.add(note)
         conv.updated_at = _now()
@@ -148,13 +214,13 @@ async def run_turn(session: Session, conv: Conversation, user: User,
         session.commit()
         session.refresh(note)
         yield "handoff", {"status": "awaiting_confirm", "ticket_id": None}
-        yield "delta", {"text": HANDOFF_ASK}
+        yield "delta", {"text": persona().handoff_ask}
         yield "done", {"assistant_message_id": note.id}
         return
 
     # ---- P3 状态机：人工服务中机器人挂起 ----
     if conv.handoff_status in ("pending_human", "human"):
-        tip = (HANDOFF_QUEUED if conv.handoff_status == "pending_human"
+        tip = (persona().handoff_queued if conv.handoff_status == "pending_human"
                else "当前由人工客服为您服务，您的消息已同步给客服。")
         note = Message(conversation_id=conv_id, role="assistant", content=tip,
                        meta_json=json.dumps({"from": "system_handoff"}, ensure_ascii=False))
@@ -168,11 +234,13 @@ async def run_turn(session: Session, conv: Conversation, user: User,
         yield "done", {"assistant_message_id": note.id}
         return
 
-    try:
-        model = get_chat_model()
-    except ModelNotConfiguredError as e:
-        yield "error", {"message": str(e)}
-        return
+    # 提前探一次配置：备用链全断时给买家的是可读错误，而不是循环里冒出来的堆栈文案
+    if not any(is_configured(p) for p in chat_chain()):
+        try:
+            get_chat_model()
+        except ModelNotConfiguredError as e:
+            yield "error", {"message": str(e)}
+            return
 
     # ---- 上下文组装：system + 中期摘要 + 短期滑窗 + 本轮消息 ----
     stm = ShortTermMemory.from_settings()
@@ -203,56 +271,42 @@ async def run_turn(session: Session, conv: Conversation, user: User,
     interrupt_reason: str | None = None
     try:
         tools = await build_tools_async(user, session)
-        bound = model.bind_tools(tools) if tools else model
         tools_by_name = {t.name: t for t in tools}
         messages = list(lc_messages)
 
-        for _round in range(MAX_TOOL_ROUNDS):
-            acc = None
-            async for chunk in bound.astream(messages):
-                acc = chunk if acc is None else acc + chunk
-                # 工具调用参数流式拼半截时 text 增量仍可能是思考文本，照常下发
-                if isinstance(chunk.content, str) and chunk.content:
-                    answer_parts.append(chunk.content)
-                    yield "delta", {"text": chunk.content}
-            if acc is None:
-                break
-            messages.append(acc)
-            calls = getattr(acc, "tool_calls", None) or []
-            if not calls:
-                break  # 最终回答已流式输出
-            for call in calls:
-                yield "tool", {"name": call["name"], "args": call["args"], "status": "start"}
-                # ---- P4: MCP 需确认工具 → 网页端挂起等确认卡片；平台端直接拒绝 ----
-                from app.services.mcp.manager import is_confirm_required
-
-                if is_confirm_required(call["name"]) and interactive:
-                    from app.services.mcp.confirm import create_request, wait_decision
-
-                    rid = create_request(conv_id, uid, call["name"], call["args"])
-                    yield "confirm_request", {"request_id": rid, "name": call["name"],
-                                              "args": call["args"]}
-                    approved = await wait_decision(rid)
-                    out = (await _run_tool(tools_by_name, call) if approved
-                           else "用户拒绝了该操作。")
-                elif is_confirm_required(call["name"]):
-                    out = "该操作需要用户在网页端确认，平台渠道已取消。"
-                else:
-                    out = await _run_tool(tools_by_name, call)
-                yield "tool", {"name": call["name"], "args": call["args"],
-                               "status": "end", "output": str(out)[:400]}
-                tool_trace.append({"name": call["name"], "args": call["args"]})
-                # P3: request_handoff 成功 → 状态机切换并通知调用方
-                if call["name"] == "request_handoff":
-                    try:
-                        from app.services.wecom.handoff import apply_handoff_from_tool
-
-                        info = apply_handoff_from_tool(conv_id, out)
-                        if info:
-                            yield "handoff", info
-                    except Exception:
-                        logger.exception("handoff 状态更新失败")
-                messages.append(ToolMessage(tool_call_id=call["id"], content=str(out)))
+        # 备用模型链：default_model 先跑，失败且还没吐出任何字时才换下一个 provider 重来
+        # （已经流出去的字收不回来，换模型重跑会让买家看到前后矛盾的回答）
+        providers = chat_chain()
+        for attempt, provider in enumerate(providers, start=1):
+            try:
+                model = get_chat_model(provider)
+            except ModelNotConfiguredError:
+                if attempt == len(providers):
+                    raise
+                logger.warning("备用模型 {} 未配置 api_key，跳过", provider)
+                continue
+            model_name = manager_model_id("chat", provider)
+            bound = model.bind_tools(tools) if tools else model
+            try:
+                async for event in _model_rounds(
+                        bound, tools_by_name, messages, tool_trace,
+                        conv_id=conv_id, uid=uid,
+                        interactive=interactive, provider=provider, model_name=model_name):
+                    if event[0] == "__text__":
+                        answer_parts.append(event[1])
+                        # 增量必须同步下发（chat.py 转 SSE、平台侧聚合 delta 回复买家），
+                        # 只攒不落会让买家等整段生成完才看到第一个字
+                        yield "delta", {"text": event[1]}
+                    else:
+                        yield event
+            except Exception:
+                # 已经吐出过字就不再换环（重跑会让买家看到前后矛盾的回答）；
+                # 链尾失败必须上抛给外层转成 error 事件，否则整轮只回 done + 空回答
+                if answer_parts or attempt == len(providers):
+                    raise
+                logger.warning("模型 {} 调用失败，尝试备用链下一环", provider)
+                continue
+            break
 
         full = "".join(answer_parts)
         cites = citation_collector.get() or []

@@ -6,15 +6,36 @@
 B1-2 起上传/重入库/重建向量都是"排队 → 任务线程执行"，所以接口只断言受理成功，
 真正的完成用 _wait_job 轮询 /knowledge/jobs（不要靠 sleep，慢机器上会假失败）。
 """
+import os
 import sys
 import time
 from pathlib import Path
 
 import httpx
 
-BASE = "http://127.0.0.1:7861/api/v1"
+# CS_BASE_URL 让 ci_smoke.py 能把本脚本指向临时端口上自动拉起的服务；默认仍是本机 7861
+BASE = f"{os.environ.get('CS_BASE_URL', 'http://127.0.0.1:7861')}/api/v1"
 # 演示语料按脚本自身位置定位：从仓库根、从 src/backend、从容器里跑都是同一个文件
 DEMO_DIR = Path(__file__).resolve().parents[1] / "data"
+_CORPUS_MODULE = Path(__file__).resolve().parent / "demo_corpus.py"
+def _ensure_demo_files() -> None:
+    """演示语料没进 git（data/ 整目录被 gitignore），全新检出时现场补出来。
+
+    生成逻辑在 demo_corpus.py 里（内容按 eval/cases.yaml 的断言倒推），
+    这里只负责把它请进来：缺文件时 smoke 会在"上传演示文件"那步 FileNotFoundError。
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("demo_corpus", _CORPUS_MODULE)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    made = module.ensure_demo_files(DEMO_DIR)
+    if made:
+        print(f"[demo] 演示语料缺失，已现场生成：{', '.join(m.name for m in made)}")
+
+
 ok = fail = 0
 
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -77,6 +98,22 @@ c.post(f"{BASE}/auth/register", json={"username": "viewer", "password": "view123
 vtok = c.post(f"{BASE}/auth/login", json={"username": "viewer", "password": "view123456"}).json()["access_token"]
 V = {"Authorization": f"Bearer {vtok}"}
 
+# 能力探测：套餐类 key 常只放行对话模型，embedding 无权限时"向量化齐全"是**预期不成立**，
+# 这类断言必须报 SKIP 而不是 FAIL——否则无 key 的 CI 会一直红，而红久了就没人看它。
+_caps = (c.get(f"{BASE}/system/status", headers=H).json().get("capabilities") or {})
+EMBED_READY = bool(_caps.get("embedding"))
+print(f"模型能力: {_caps or '旧后端无 capabilities 字段（按可用处理）'}")
+if not _caps:
+    EMBED_READY = True
+
+
+def check_vec(name: str, cond: bool, extra: str = "") -> None:
+    if not EMBED_READY:
+        print(f"SKIP  {name}（embedding 不可用，检索降级 BM25 是预期行为）{extra}")
+        return
+    check(name, cond, extra)
+
+
 check("B1-7 admin 角色下发", c.get(f"{BASE}/auth/me", headers=H).json().get("role") == "admin")
 check("B1-7 普通用户角色为 user", c.get(f"{BASE}/auth/me", headers=V).json().get("role") == "user")
 check("B1-7 普通用户不可列用户", c.get(f"{BASE}/auth/users", headers=V).status_code == 403)
@@ -86,6 +123,7 @@ check("B1-7 普通用户不可改角色", c.patch(f"{BASE}/auth/users/1/role", h
 # ---- P1 知识库上传（B1-2：受理即返回，入库由任务线程完成）----
 # 冒烟自己上传的演示文件必须自己收尾：库里可能已有真实业务文件，
 # 留下副本会让每次冒烟都往生产语料里灌重复数据。
+_ensure_demo_files()
 demo_ids, upload_jobs = [], []
 for name, mime in (("demo_products.xlsx", XLSX), ("demo_policy.txt", "text/plain")):
     with open(DEMO_DIR / name, "rb") as f:
@@ -148,8 +186,8 @@ txt_id = demo_ids[1]
 page = c.get(f"{BASE}/knowledge/files/{txt_id}/chunks?limit=1&offset=0", headers=H).json()
 check("P1 分块分页返回", page["total"] >= 1 and len(page["items"]) == 1
       and page["items"][0]["chunk_id"] > 0, f"total={page.get('total')}")
-check("P1 分块向量状态可见", page["items"][0]["vectorized"] is True,
-      f"vectorized={page['items'][0].get('vectorized')}")
+check_vec("P1 分块向量状态可见", page["items"][0]["vectorized"] is True,
+          f"vectorized={page['items'][0].get('vectorized')}")
 
 # 重建向量：文件状态可能还是 ready（worker 还没来得及写 parsing），只能靠任务行判定
 r = c.post(f"{BASE}/knowledge/files/{txt_id}/reindex", headers=H)
@@ -157,8 +195,8 @@ job = _last_job("reindex", txt_id) if r.status_code == 200 else None
 check("P1 重建向量受理", r.status_code == 200 and job is not None,
       f"{r.status_code} {str(r.text)[:60]}")
 jr = _wait_job(job["id"]) if job else {}
-check("P1 重建向量完成", jr.get("status") == "done" and _wait_settled(txt_id)["status"] == "ready",
-      f"job={jr.get('status')} err={str(jr.get('error'))[:60]}")
+check_vec("P1 重建向量完成", jr.get("status") == "done" and _wait_settled(txt_id)["status"] == "ready",
+          f"job={jr.get('status')} err={str(jr.get('error'))[:60]}")
 
 r = c.post(f"{BASE}/knowledge/files/{txt_id}/reingest", headers=H)
 job = _last_job("reingest", txt_id) if r.status_code == 200 else None
@@ -170,7 +208,7 @@ row = _wait_settled(txt_id)
 check("P1 重新入库重建切片", jr.get("status") == "done" and row["status"] == "ready"
       and row["chunk_count"] >= 1,
       f"job={jr.get('status')} status={row['status']} chunks={row['chunk_count']} err={str(row.get('error'))[:60]}")
-check("P1 重新入库后向量齐全", all(i["vectorized"] for i in c.get(
+check_vec("P1 重新入库后向量齐全", all(i["vectorized"] for i in c.get(
     f"{BASE}/knowledge/files/{txt_id}/chunks?limit=50", headers=H).json()["items"]))
 check("P1 未知文件 404", c.post(f"{BASE}/knowledge/files/999999/reingest", headers=H).status_code == 404)
 check("P1 未知文件分块 404", c.get(f"{BASE}/knowledge/files/999999/chunks", headers=H).status_code == 404)

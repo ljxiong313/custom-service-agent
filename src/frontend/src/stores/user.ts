@@ -4,11 +4,17 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { http } from '@/apis/http'
 
-export type UserRole = 'user' | 'admin'
+export type UserRole = 'user' | 'staff' | 'admin'
 export interface UserInfo { id: number; username: string; email: string | null; role: UserRole }
 
 // pinia-plugin-persistedstate 默认用 store id 作 localStorage 键
 const PERSIST_KEY = 'user'
+
+export const ROLE_LABELS: Record<UserRole, string> = {
+  user: '普通成员',
+  staff: '客服',
+  admin: '管理员',
+}
 
 export const useUserStore = defineStore('user', () => {
   const token = ref<string>('')
@@ -17,6 +23,8 @@ export const useUserStore = defineStore('user', () => {
   const isLoggedIn = computed(() => !!token.value)
   // 知识库重入库/删除、MCP 服务器增删改等破坏性操作仅管理员可用（后端同样有 403 门禁）
   const isAdmin = computed(() => user.value?.role === 'admin')
+  // 客服及以上：跨用户会话运营台、工单看板、MCP 确认卡片、外发箱
+  const isStaff = computed(() => user.value?.role === 'admin' || user.value?.role === 'staff')
 
   function setToken(t: string | null) {
     token.value = t ?? ''
@@ -49,6 +57,6 @@ export const useUserStore = defineStore('user', () => {
     localStorage.removeItem(PERSIST_KEY)
   }
 
-  return { token, user, isLoggedIn, isAdmin, login, register, fetchMe, logout }
+  return { token, user, isLoggedIn, isAdmin, isStaff, login, register, fetchMe, logout }
 }, { persist: true })
 

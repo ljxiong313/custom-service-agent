@@ -15,14 +15,17 @@ from app.db.models import (
     ConversationSummary,
     ExternalConversation,
     HandoffTicket,
+    MemoryJob,
     Message,
+    SessionRating,
+    ToolConfirmRequest,
 )
 
 
 def delete_conversation(session: Session, conv: Conversation) -> None:
-    """删除会话及其全部附属行（消息/摘要/工单/平台映射/入站幂等记录）。"""
+    """删除会话及其全部附属行（消息/摘要/工单/平台映射/确认请求/记忆任务）。"""
     conv_id = conv.id or 0
-    n_msg = n_sum = n_ticket = n_ext = 0
+    n_msg = n_sum = n_ticket = n_ext = n_confirm = n_memory = n_rating = 0
     for m in session.exec(select(Message).where(Message.conversation_id == conv_id)).all():
         session.delete(m)
         n_msg += 1
@@ -40,7 +43,24 @@ def delete_conversation(session: Session, conv: Conversation) -> None:
             ExternalConversation.conversation_id == conv_id)).all():
         session.delete(e)
         n_ext += 1
+    # B3-8 新加的两张会话子表：漏一张，删会话就会因 foreign_keys=ON 直接报错
+    for c in session.exec(select(ToolConfirmRequest).where(
+            ToolConfirmRequest.conversation_id == conv_id)).all():
+        session.delete(c)
+        n_confirm += 1
+    for j in session.exec(select(MemoryJob).where(
+            MemoryJob.conversation_id == conv_id)).all():
+        session.delete(j)
+        n_memory += 1
+    for r in session.exec(select(SessionRating).where(
+            SessionRating.conversation_id == conv_id)).all():
+        session.delete(r)
+        n_rating += 1
+    # 必须先 flush 再删父行：Message/HandoffTicket 这些有 relationship，SQLAlchemy 能自己
+    # 排出删除顺序；B3 新加的确认请求/记忆任务/评分表没有 relationship，父行会被提前删除，
+    # 在 foreign_keys=ON 下直接抛 FOREIGN KEY constraint failed。
+    session.flush()
     session.delete(conv)
     session.commit()
-    logger.info("删除会话#{}：消息={} 摘要={} 工单={} 平台映射={}",
-                conv_id, n_msg, n_sum, n_ticket, n_ext)
+    logger.info("删除会话#{}：消息={} 摘要={} 工单={} 平台映射={} 确认请求={} 记忆任务={} 评分={}",
+                conv_id, n_msg, n_sum, n_ticket, n_ext, n_confirm, n_memory, n_rating)

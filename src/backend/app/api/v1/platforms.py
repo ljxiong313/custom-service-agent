@@ -10,11 +10,20 @@ from __future__ import annotations
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 from sqlmodel import func, select
 
-from app.core.security import CurrentUser, DbSession
+from app.core.security import DbSession, RequireStaff
 from app.db.models import ExternalConversation
 from app.services import outbox
 from app.services.platforms import adapters as _adapters  # noqa: F401  触发注册
-from app.services.platforms.base import ADAPTERS, PLATFORM_ORDER, conf, get_adapter, is_mock, outbox_records, readiness
+from app.services.platforms.base import (
+    ADAPTERS,
+    PLATFORM_ORDER,
+    conf,
+    get_adapter,
+    is_mock,
+    outbox_records,
+    public_base_url,
+    readiness,
+)
 from app.services.platforms.inbound import handle_inbound
 
 # ---- 回调（免 JWT，挂在 /api 下） ----
@@ -55,7 +64,7 @@ admin_router = APIRouter(prefix="/platforms", tags=["platform"])
 
 
 @admin_router.get("/status")
-def platforms_status(user: CurrentUser, session: DbSession):
+def platforms_status(user: RequireStaff, session: DbSession):
     """各平台接入配置概览（只回显布尔与网关地址，绝不回显密钥）。"""
     counts = dict(session.exec(
         select(ExternalConversation.platform, func.count())
@@ -73,10 +82,12 @@ def platforms_status(user: CurrentUser, session: DbSession):
 
 
 @admin_router.get("/readiness")
-def platforms_readiness(user: CurrentUser):
+def platforms_readiness(user: RequireStaff):
     """出站/入站就绪度静态自检：缺哪个配置项、影响哪条链路（不联网、不回显密钥值）。"""
     items = [readiness(name) for name in PLATFORM_ORDER]
     blocked = sorted({k for i in items for k in i["missing_out"]})
+    # ★ 待核对口径：与"配没配"无关——值填了也可能是平台改版后的旧口径，必须人工过一遍文档
+    review_keys = sorted({k for i in items for k in i["needs_review_keys"]})
     return {
         "platforms": items,
         "summary": {
@@ -88,7 +99,11 @@ def platforms_readiness(user: CurrentUser):
             "risks": sum(len([r for r in i["risks"] if r["level"] != "info"]) for i in items),
             # 接真实平台时要补的配置项全集：全部补齐才可能 ready_out
             "missing_keys": blocked,
+            "needs_review_keys": review_keys,
+            "public_base_url_configured": bool(public_base_url()),
             "outbox_counts": outbox.count_by_channel(),
+            # 死信：退避重试用尽仍失败的外发，买家侧等于没回复，只能人工补发
+            "outbox_retry": outbox.count_retry_queue(),
             "hint": ("mock=true 时链路可演示但不送达买家；"
                      "填齐 missing_keys 并把 mock 改为 false 才会真实外呼（见 docs/平台接入.md 第 7 节）"
                      if blocked else "各平台出站参数已齐，可将 mock 置为 false 真实外呼"),
@@ -97,7 +112,7 @@ def platforms_readiness(user: CurrentUser):
 
 
 @admin_router.get("/outbox")
-def platforms_outbox(user: CurrentUser, limit: int = 50):
+def platforms_outbox(user: RequireStaff, limit: int = 50):
     """外发箱：mock 送达回执与 skipped/failed 留痕（B1-2 起落库，重启不丢）。"""
     per_page = max(1, min(limit, 200))
     return {name: outbox_records(name, per_page) for name in ADAPTERS}

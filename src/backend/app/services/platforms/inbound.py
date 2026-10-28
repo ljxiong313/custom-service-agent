@@ -20,6 +20,7 @@ from sqlmodel import Session, col, select
 from app.core.agents.runner import run_turn
 from app.db.models import Conversation, ExternalConversation, InboundDedupe, User, pk
 from app.db.session import engine
+from app.utils import media_url
 
 from .base import InboundMessage, get_adapter
 
@@ -181,7 +182,9 @@ def deliver_media(conversation_id: int, attachments: list[dict]) -> bool:
     adapter = get_adapter(platform)
     total = delivered = 0
     for item in attachments or []:
-        url = str(item.get("url") or "")
+        # 库里存的是裸路径 /api/files/<文件名>；买家在平台客户端里点不开相对路径，
+        # 也读不到需要鉴权的文件——出站一律换成"绝对地址 + 签名"的临时链接。
+        url = media_url.absolute_url(str(item.get("url") or ""))
         if not url:
             continue
         total += 1

@@ -10,8 +10,8 @@
       </router-link>
     </el-tooltip>
     <div class="spacer" />
-    <!-- 角色徽标：窄侧栏没有文字，运营需要一眼确认自己是不是管理员（决定按钮是否可点） -->
-    <el-tooltip :content="`${userStore.user?.username ?? '未登录'}（${userStore.isAdmin ? '管理员' : '普通成员'}）`" placement="right">
+    <!-- 角色徽标：窄侧栏没有文字，运营需要一眼确认自己的权限档（决定按钮是否可点） -->
+    <el-tooltip :content="`${userStore.user?.username ?? '未登录'}（${roleLabel}）`" placement="right">
       <el-dropdown trigger="click" @command="onCommand">
         <div class="nav-item avatar" role="button" tabindex="0" aria-label="账号菜单">
           <el-avatar :size="30">{{ (userStore.user?.username ?? '?')[0] }}</el-avatar>
@@ -23,30 +23,36 @@
         </template>
       </el-dropdown>
     </el-tooltip>
-    <div class="role-badge" :class="userStore.isAdmin ? 'admin' : 'member'"
-         :aria-label="userStore.isAdmin ? '当前角色：管理员' : '当前角色：普通成员'">
-      {{ userStore.isAdmin ? '管理' : '成员' }}
+    <div class="role-badge" :class="userStore.isStaff ? 'admin' : 'member'"
+         :aria-label="`当前角色：${roleLabel}`">
+      {{ roleShort }}
     </div>
   </nav>
 </template>
 
 <script setup lang="ts">
-import { ChatDotRound, Collection, Connection, Reading, Service, Setting } from '@element-plus/icons-vue'
+import { computed } from 'vue'
+import { ChatDotRound, Collection, Connection, DataAnalysis, Reading, Service, Setting } from '@element-plus/icons-vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useUserStore } from '@/stores/user'
+import { ROLE_LABELS, useUserStore } from '@/stores/user'
 
 const userStore = useUserStore()
 const route = useRoute()
 const router = useRouter()
 
-const navItems = [
-  { path: '/chat', label: '聊天', icon: ChatDotRound },
-  { path: '/knowledge', label: '知识库', icon: Reading },
-  { path: '/handoff', label: '转人工工作台', icon: Service },
-  { path: '/memory', label: '记忆', icon: Collection },
-  { path: '/mcp', label: 'MCP 服务', icon: Connection },
-  { path: '/settings', label: '设置', icon: Setting },
-]
+const roleLabel = computed(() => ROLE_LABELS[userStore.user?.role ?? 'user'])
+const roleShort = computed(() => (userStore.isAdmin ? '管理' : userStore.isStaff ? '客服' : '成员'))
+
+// staffOnly 的入口对普通成员隐藏：后端同样会 403，藏起来少一次无谓的报错弹窗
+const navItems = computed(() => [
+  { path: '/chat', label: '聊天', icon: ChatDotRound, staffOnly: false },
+  { path: '/knowledge', label: '知识库', icon: Reading, staffOnly: false },
+  { path: '/handoff', label: '转人工工作台', icon: Service, staffOnly: true },
+  { path: '/dashboard', label: '运营看板', icon: DataAnalysis, staffOnly: true },
+  { path: '/memory', label: '记忆', icon: Collection, staffOnly: false },
+  { path: '/mcp', label: 'MCP 服务', icon: Connection, staffOnly: false },
+  { path: '/settings', label: '设置', icon: Setting, staffOnly: false },
+].filter((i) => !i.staffOnly || userStore.isStaff))
 
 function isActive(path: string) {
   return route.path === path || route.path.startsWith(path + '/')

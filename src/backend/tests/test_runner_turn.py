@@ -13,7 +13,8 @@ from langchain_core.messages import AIMessageChunk
 from sqlmodel import Session, select
 
 from app.core.agents import runner
-from app.db.models import Conversation, HandoffTicket, Message, User
+from app.core.agents.persona import persona
+from app.db.models import Conversation, HandoffTicket, Message, ToolConfirmRequest, User
 from app.db.session import engine
 from app.services.mcp import manager as mcp_manager
 from app.services.memory import pipeline
@@ -125,7 +126,8 @@ def test_keyword_asks_for_confirm_before_calling_model(monkeypatch, pair):
     events = _collect(conv, user, "我要投诉")
     assert [e[0] for e in events] == ["meta", "handoff", "delta", "done"]
     assert events[1][1]["status"] == "awaiting_confirm"
-    assert events[2][1]["text"] == runner.HANDOFF_ASK
+    # 文案来自 agent 配置（persona.persona()），不再硬编码在 runner 里
+    assert events[2][1]["text"] == persona().handoff_ask
     assert model.calls == 0
     with Session(engine) as s:
         assert s.get(Conversation, conv.id).handoff_status == "awaiting_confirm"
@@ -324,7 +326,12 @@ def test_confirm_required_tool_is_cancelled_on_platform(monkeypatch, pair):
 
 
 def test_confirm_card_approved_in_band(monkeypatch, pair):
-    """网页端：卡片下发后 runner 挂在 future 上，点"允许"才执行工具。"""
+    """网页端：卡片下发后 runner 轮询库等裁决，点"允许"把行置 approved 才执行工具。
+
+    B3-8 起注册表落库、不再有进程内 _pending/future；conftest 每用例清表，
+    这里无需再手工清理。resolve 发生在生成器 yield 之后、wait_decision 首轮
+    读取之前（同一线程串行推进），所以不会卡在 1 秒轮询上，也不存在死锁。
+    """
     user, conv = pair
     call = {"name": "refund_apply", "args": {}, "id": "c1", "type": "tool_call"}
     model = FakeModel([
@@ -335,7 +342,6 @@ def test_confirm_card_approved_in_band(monkeypatch, pair):
     monkeypatch.setattr(mcp_manager, "is_confirm_required", lambda name: True)
 
     from app.services.mcp import confirm
-    confirm._pending.clear()
 
     seen = {}
 
@@ -355,7 +361,10 @@ def test_confirm_card_approved_in_band(monkeypatch, pair):
     assert seen["rid"]
     end = next(d for n, d in events if n == "tool" and d["status"] == "end")
     assert end["output"] == "退款成功"
-    confirm._pending.clear()
+    with Session(engine) as s:                    # 裁决落库留痕：状态机终态是 approved
+        row = s.exec(select(ToolConfirmRequest).where(
+            ToolConfirmRequest.request_id == seen["rid"])).first()
+        assert row is not None and row.status == "approved"
 
 
 def test_confirm_denied_skips_tool_execution(monkeypatch, pair):

@@ -46,6 +46,12 @@ def _msg(platform="taobao", buyer="b1", text="有货吗", msg_id=""):
                                buyer_id=buyer, text=text, external_msg_id=msg_id)
 
 
+def _public_base(monkeypatch, value: str):
+    """钉住 server.public_base_url：媒体链接能不能被买家点开只取决于它。"""
+    server = get_settings().get("server", {}) or {}
+    monkeypatch.setitem(get_settings(), "server", {**server, "public_base_url": value})
+
+
 # ---- 签名 ----
 
 def test_md5_sign_top_is_order_independent_and_uppercase():
@@ -172,6 +178,82 @@ def test_media_send_mocked_records_media_kind():
     assert rec["status"] == "mocked" and rec["kind"] == "media"
 
 
+# ---- 附件可达性：真实外发时相对路径链接买家点不开，绝不发死链 ----
+
+def test_real_mode_relative_media_is_skipped_not_sent(conf_patch, monkeypatch):
+    """媒体出站没有公网地址时不假装送达：skipped + error 指名 server.public_base_url。"""
+    _public_base(monkeypatch, "")
+    conf_patch("jd", mock=False, reply_method="m", app_key="ak", app_secret="sk",
+               access_token="tok", media_method="jd.img.send")
+    calls = []
+    monkeypatch.setattr(platform_adapters, "http_post_form",
+                        lambda url, form: calls.append((url, form)) or {"ok": True})
+    rec = Jd().send_media("shop1", "buyer1", "/api/files/a.png?exp=1&sig=dead", name="a.png")
+    assert rec["status"] == "skipped" and not calls          # 一次网关都不该打
+    assert "public_base_url" in rec["error"] and "点不开" in rec["error"]
+    # 降级文案里不能再出现相对链接
+    assert rec["text"] == f"[附件] a.png: {base.NO_PUBLIC_BASE_HINT}"
+
+
+def test_real_mode_absolute_media_link_still_goes_out(conf_patch, monkeypatch):
+    _public_base(monkeypatch, "https://cs.example.com")
+    conf_patch("jd", mock=False, reply_method="m", app_key="ak", app_secret="sk",
+               access_token="tok", media_method="jd.img.send")
+    calls = []
+    monkeypatch.setattr(platform_adapters, "http_post_form",
+                        lambda url, form: calls.append((url, form)) or {"ok": True})
+    rec = Jd().send_media("shop1", "buyer1", "https://cs.example.com/api/files/a.png?exp=1&sig=x",
+                          name="a.png")
+    assert rec["status"] == "sent" and len(calls) == 1
+    assert "https://cs.example.com/api/files/a.png" in rec["text"]
+
+
+def test_real_mode_text_body_relative_attachment_is_replaced_with_hint(conf_patch, monkeypatch):
+    """运营台代答的正文里带相对附件链接时，出站前换成可读提示（不发点不开的死链）。"""
+    _public_base(monkeypatch, "")
+    conf_patch("taobao", mock=False, reply_method="m", app_key="ak", app_secret="sk",
+               access_token="tok", session_key=None)
+    calls = []
+    monkeypatch.setattr(platform_adapters, "http_post_form",
+                        lambda url, form: calls.append((url, form)) or {"ok": True})
+    body = "说明书在这里\n[附件] 说明书.pdf: /api/files/ab12.pdf?exp=1700000000&sig=deadbeef"
+    rec = Taobao().send_reply("shop1", "buyer1", body)
+    assert rec["status"] == "sent"
+    sent_text = calls[0][1]["content"]
+    assert base.NO_PUBLIC_BASE_HINT in sent_text and "/api/files/" not in sent_text
+    assert sent_text.startswith("说明书在这里")          # 正文其它部分不动
+    assert base.NO_PUBLIC_BASE_HINT in rec["text"]      # 外发箱留的也是降级后的文案
+
+
+def test_real_mode_absolute_and_non_media_urls_are_untouched(conf_patch, monkeypatch):
+    _public_base(monkeypatch, "https://cs.example.com")
+    conf_patch("taobao", mock=False, reply_method="m", app_key="ak", app_secret="sk",
+               access_token="tok", session_key=None)
+    calls = []
+    monkeypatch.setattr(platform_adapters, "http_post_form",
+                        lambda url, form: calls.append((url, form)) or {"ok": True})
+    body = ("看图 https://cs.example.com/api/files/a.png?exp=1&sig=x "
+            "以及 https://example.com/order/12")
+    Taobao().send_reply("shop1", "buyer1", body)
+    assert calls[0][1]["content"] == body                       # 绝对链接与原样外链都不碰
+
+
+def test_mock_mode_body_keeps_the_relative_link_as_is():
+    """演示形态不降级：外发箱里要看得见我们真正会发出去的形状。"""
+    rec = Taobao().send_reply("shop1", "buyer1", "[附件] a.png: /api/files/a.png?exp=1&sig=x")
+    assert rec["status"] == "mocked" and "/api/files/a.png" in rec["text"]
+
+
+def test_mark_unreachable_media_helper_is_idempotent(conf_patch, monkeypatch):
+    conf_patch("jd", mock=False)
+    _public_base(monkeypatch, "")
+    text = "看 /api/files/a.png?exp=1&sig=x 与 https://h.example.com/api/files/b.png"
+    once = base.mark_unreachable_media("jd", text)
+    assert base.NO_PUBLIC_BASE_HINT in once and once.count("https://h.example.com") == 1
+    assert base.mark_unreachable_media("jd", once) == once      # 再跑一遍不叠加
+    assert base.mark_unreachable_media("taobao", once) == once  # mock 渠道原样返回
+
+
 # ---- 就绪自检（B2-1：静态、不回显密钥值）----
 
 def test_readiness_reports_missing_and_risks_without_secret_values(conf_patch):
@@ -198,6 +280,54 @@ def test_readiness_mock_platform_is_ready_for_demo():
     report = base.readiness("douyin")
     assert report["mock"] is True and report["ready_out"] is True
     assert any(r["level"] == "info" for r in report["risks"])
+
+
+def test_readiness_flags_missing_public_base_url_as_risk(conf_patch, monkeypatch):
+    """真实模式 + 没配公网地址 = 买家收到点不开的相对链接，必须按"风险"级报出来。"""
+    _public_base(monkeypatch, "")
+    conf_patch("taobao", mock=False)
+    report = base.readiness("taobao")
+    risks = {r["key"]: r for r in report["risks"]}
+    assert "public_base_url" in risks
+    assert risks["public_base_url"]["level"] == "risk"
+    assert "点不开" in risks["public_base_url"]["message"]
+    assert report["public_base_url"] == ""
+
+
+def test_readiness_does_not_flag_public_base_url_when_configured_or_mocked(conf_patch, monkeypatch):
+    _public_base(monkeypatch, "https://cs.example.com")
+    conf_patch("taobao", mock=False)
+    assert "public_base_url" not in {r["key"] for r in base.readiness("taobao")["risks"]}
+    # mock 渠道不报这条：演示形态本来就没有公网域名（风险是给真实外呼看的）
+    _public_base(monkeypatch, "")
+    conf_patch("taobao", mock=True)
+    assert "public_base_url" not in {r["key"] for r in base.readiness("taobao")["risks"]}
+
+
+def test_readiness_marks_star_fields_as_needing_human_review(conf_patch):
+    """★ 待核对口径项透出 needs_review：配了值不等于配对了，平台改版后必须人工核对。"""
+    taobao, douyin = base.readiness("taobao"), base.readiness("douyin")
+    flags = {i["key"]: i["needs_review"] for i in taobao["items"]}
+    assert flags["reply_method"] and flags["media_method"] and flags["gateway"]
+    assert flags["to_uid_field"] and flags["content_field"]
+    assert flags["media_url_field"] and flags["media_type_field"] and flags["ack"]
+    # 不需要核对的：开关与密钥本身（值对不对是另一回事，口径没有"版本差异"）
+    assert not flags["enabled"] and not flags["mock"] and not flags["app_secret"]
+    assert not flags["app_key"] and not flags["access_token"] and not flags["callback_verify"]
+    # 只有抖店的验签口径多版本并存（TOP 同族 md5 各家文档一致）
+    dy_flags = {i["key"]: i["needs_review"] for i in douyin["items"]}
+    assert dy_flags["callback_verify"] is True
+    assert taobao["needs_review_keys"] and "reply_method" in taobao["needs_review_keys"]
+
+
+def test_readiness_api_exposes_review_and_public_base(client, admin, monkeypatch):
+    _public_base(monkeypatch, "")
+    body = client.get("/api/v1/platforms/readiness", headers=admin["headers"]).json()
+    summary = body["summary"]
+    assert summary["public_base_url_configured"] is False
+    assert {"reply_method", "media_method", "gateway"} <= set(summary["needs_review_keys"])
+    assert all(i["needs_review"] for p in body["platforms"] for i in p["items"]
+               if i["key"] in p["needs_review_keys"])
 
 
 def test_platforms_api_endpoints_shape(client, admin):

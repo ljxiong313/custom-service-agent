@@ -17,7 +17,7 @@ from sqlmodel import Session
 from app.config import get_settings
 from app.db.models import HandoffTicket
 from app.db.session import engine
-from app.services.wecom.crypto import WecomCrypto
+from app.services.wecom.crypto import WecomCrypto, extract_encrypt
 from app.services.wecom.handoff import staff_reply
 
 router = APIRouter(prefix="/wecom", tags=["wecom"])
@@ -44,8 +44,8 @@ def verify(msg_signature: str = Query(...), timestamp: str = Query(...),
 async def receive(request: Request, msg_signature: str = Query(...),
                   timestamp: str = Query(...), nonce: str = Query(...)):
     body = (await request.body()).decode("utf-8")
-    encrypt = ET.fromstring(body).findtext("Encrypt") or ""
-    plain = _crypto().verify_body(msg_signature, timestamp, nonce, encrypt)
+    # 取密文/验签/解密三段口径都在 wecom.crypto 的纯函数里（坏报文一律 400，不再 500）
+    plain = _crypto().verify_body(msg_signature, timestamp, nonce, extract_encrypt(body))
     xml = ET.fromstring(plain)
     msg_type = xml.findtext("MsgType")
     userid = xml.findtext("FromUserName") or "unknown"

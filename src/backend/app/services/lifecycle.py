@@ -26,6 +26,7 @@ from sqlmodel import Session, col, select
 from app.config import get_settings
 from app.db.models import Conversation, HandoffTicket, Message, pk
 from app.db.session import engine
+from app.utils import feedback_url
 
 
 def _now() -> datetime.datetime:
@@ -124,6 +125,10 @@ def close_conversation(conv_id: int) -> bool:
                 session.add(t)
                 logger.info("会话#{} 超时终结，工单#{} 已强制关闭", conv.id, t.id)
         text_ = "本次会话已结束，感谢您的咨询；如需继续请重新发起对话。"
+        # B3-13：开启后在告别语后面接一条带签名的回访链接（免登录但只授权本会话一票）
+        survey = feedback_url.survey_text(conv_id)
+        if survey:
+            text_ = f"{text_}\n{survey}"
         session.add(Message(conversation_id=conv_id, role="assistant", content=text_,
                             meta_json=json.dumps({"from": "system_session_closed"},
                                                  ensure_ascii=False)))
@@ -148,12 +153,20 @@ async def session_sweeper() -> None:
 
     sweep 内部走同步 DB + 平台外发，必须放线程池，否则一次慢外发会卡住事件循环，
     同进程里的 SSE 对话流跟着抖。
+
+    B3-8 起带租约：每个周期先抢 session_sweeper 约（TTL = 3 个扫描周期），
+    没抢到的进程直接跳过——多副本部署下只有一家真正在扫，其余实例随时可以在
+    持约者挂掉后 3 个周期内接管。会话级的抢行 UPDATE 依然保留，所以即使租约抖动
+    出现两个持约者，也不会重复提示或重复结单。
     """
+    from app.services import lease
+
     interval = int(get_settings().get_dotted("session.sweep_interval_seconds", 30))
-    logger.info("会话生命周期扫描任务启动（每 {}s）", interval)
+    logger.info("会话生命周期扫描任务启动（每 {}s，租约选主 holder={}）", interval, lease.HOLDER_ID)
     while True:
         try:
-            await asyncio.to_thread(sweep_once)
+            if lease.acquire("session_sweeper", ttl_seconds=max(60.0, interval * 3)):
+                await asyncio.to_thread(sweep_once)
         except Exception:
             logger.exception("会话超时扫描失败")
         await asyncio.sleep(interval)

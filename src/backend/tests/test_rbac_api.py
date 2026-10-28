@@ -1,7 +1,10 @@
-"""B1-7 RBAC 与鉴权单测：JWT 校验、角色门禁、角色变更保护。
+"""RBAC 与鉴权单测：JWT 校验、角色门禁、角色变更保护、归属过滤。
 
-口径（用户确认的设计决策）：会改动全局语料、拉起本机进程或他人账号的写操作限 admin；
-运营台跨用户读/代答保留给任意登录用户，所以这里也断言"普通坐席仍能干活"。
+口径（B3-6 收紧后）：
+- 会改动全局语料、拉起本机进程或他人账号的写操作限 admin；
+- 运营台的跨用户读/代答限 staff 及以上（此前对所有登录用户开放，等于任何买家账号
+  都能读到别人的会话与工具入参）；
+- 普通用户（role=user）只做"自己会话"的事：列表、消息、代答、工单、确认卡片都按归属过滤。
 """
 from __future__ import annotations
 
@@ -9,9 +12,11 @@ import time
 
 import jwt as pyjwt
 import pytest
+from sqlmodel import Session, select
 
 from app.config import get_settings
-from app.db.models import User
+from app.db.models import ToolConfirmRequest, User
+from app.db.session import engine
 
 SECRET = get_settings().get_dotted("security.jwt_secret")
 API = "/api/v1"
@@ -138,10 +143,22 @@ def test_cannot_demote_self(client, admin):
 
 
 def test_last_admin_cannot_be_removed(client, admin, staff):
-    """只有一个 admin 时，任何降级请求都拦住——否则没人能再改角色，等于自锁。"""
-    r = client.patch(f"{API}/auth/users/{staff['user']['id']}/role", headers=admin["headers"],
+    """admin 保护链：提权不再被误拦（B3-6 修的 bug）、降级他人要留一个 admin、不能自降。
+
+    早先的实现把保护写成 `if body.role != "admin"`，导致给普通账号提权成 staff 也被
+    409 拦下——客服根本招不进来。
+    """
+    assert client.patch(f"{API}/auth/users/{staff['user']['id']}/role",
+                        headers=admin["headers"], json={"role": "staff"}).status_code == 200
+    other = client.post(f"{API}/auth/users", headers=admin["headers"],
+                        json={"username": "cs05", "password": "longenough", "role": "admin"}).json()
+    # 两个 admin 时，降级其中一个可以（另一个还在）
+    assert client.patch(f"{API}/auth/users/{other['id']}/role", headers=admin["headers"],
+                        json={"role": "user"}).status_code == 200
+    # 只剩 boss 一个 admin：自己降自己先被"不能降级自己"拦住，不会出现无人可用的状态
+    r = client.patch(f"{API}/auth/users/{admin['user']['id']}/role", headers=admin["headers"],
                      json={"role": "user"})
-    assert r.status_code == 409 and "管理员" in r.json()["detail"]
+    assert r.status_code == 409 and "自己" in r.json()["detail"]
 
 
 def test_role_value_is_validated(client, admin, db):
@@ -160,3 +177,75 @@ def test_second_user_is_not_admin(client, admin):
                         json={"username": "cs04", "password": "secret123"}).json()
     me = client.get(f"{API}/auth/me", headers={"Authorization": f"Bearer {login['access_token']}"})
     assert me.json()["role"] == "user"
+
+
+# ---- 归属过滤（B3-6 新增）----
+
+def test_buyer_cannot_read_operator_surfaces(client, buyer):
+    """普通用户不再是"事实客服"：运营看板、工单看板、外发箱一律 403。"""
+    for path in ("/handoff/stats", "/handoff/outbox", "/platforms/outbox",
+                 "/platforms/status", "/platforms/readiness"):
+        r = client.get(f"{API}{path}", headers=buyer["headers"])
+        assert r.status_code == 403, (path, r.status_code)
+
+
+def test_buyer_only_sees_own_conversations(client, buyer, staff):
+    mine = client.post(f"{API}/conversations", headers=buyer["headers"],
+                       json={"title": "我的会话"}).json()
+    theirs = client.post(f"{API}/conversations", headers=staff["headers"],
+                         json={"title": "客服的会话"}).json()
+
+    listed = client.get(f"{API}/console/conversations", headers=buyer["headers"]).json()
+    assert {c["id"] for c in listed} == {mine["id"]}
+
+    # 读他人会话：按"不存在"处理，不给探测他人会话是否存在的信号
+    assert client.get(f"{API}/console/conversations/{theirs['id']}/messages",
+                      headers=buyer["headers"]).status_code == 404
+    assert client.post(f"{API}/console/conversations/{theirs['id']}/reply",
+                       headers=buyer["headers"], json={"text": "偷答"}).status_code == 404
+    # 自己的会话仍然可读可回
+    assert client.get(f"{API}/console/conversations/{mine['id']}/messages",
+                      headers=buyer["headers"]).status_code == 200
+
+
+def test_buyer_pending_confirms_are_scoped(client, buyer, admin, staff):
+    """确认卡片带完整工具入参，普通用户只能看到自己会话排队的那几张。
+
+    B3-8 起注册表落库且有外键（conversation_id→conversation、user_id→user，
+    SQLite foreign_keys=ON），不能再 monkeypatch 伪造条目——两张卡都用
+    create_request 建真实记录：一张挂 buyer 自己的会话，一张挂客服的会话。
+    """
+    from app.services.mcp import confirm
+
+    mine = client.post(f"{API}/conversations", headers=buyer["headers"],
+                       json={"title": "待确认"}).json()
+    theirs = client.post(f"{API}/conversations", headers=staff["headers"],
+                         json={"title": "客服的待确认"}).json()
+    rid_mine = confirm.create_request(mine["id"], buyer["user"]["id"],
+                                      "order_query", {"order": "A1"})
+    rid_theirs = confirm.create_request(theirs["id"], staff["user"]["id"],
+                                        "order_query", {"order": "B2"})
+
+    items = client.get(f"{API}/mcp/pending", headers=buyer["headers"]).json()["items"]
+    assert [i["request_id"] for i in items] == [rid_mine]
+    assert items[0]["args"] == {"order": "A1"}
+    # staff/admin 是全量视角：两张卡都看得到
+    for who in (admin, staff):
+        seen = client.get(f"{API}/mcp/pending", headers=who["headers"]).json()["items"]
+        assert {i["request_id"] for i in seen} == {rid_mine, rid_theirs}
+    # 替别人点确认：按"已过期"处理
+    assert client.post(f"{API}/mcp/confirm", headers=buyer["headers"],
+                       json={"request_id": rid_theirs, "approved": True}).status_code == 410
+    # 越权点击不能把别人的卡片裁决掉
+    with Session(engine) as s:
+        row = s.exec(select(ToolConfirmRequest).where(
+            ToolConfirmRequest.request_id == rid_theirs)).first()
+        assert row is not None and row.status == "pending"
+
+
+def test_staff_sees_all_conversations(client, staff, buyer):
+    mine = client.post(f"{API}/conversations", headers=buyer["headers"],
+                       json={"title": "买家会话"}).json()
+    ids = {c["id"] for c in client.get(f"{API}/console/conversations",
+                                       headers=staff["headers"]).json()}
+    assert mine["id"] in ids

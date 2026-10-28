@@ -1,11 +1,13 @@
-# 后端单容器部署。**不要 scale 副本**：进程内状态（sweeper、MCP 确认表）要求单进程。
+# 智能客服 Agent 单机部署。
 #
-# 本机没有 docker，这份文件未经 `docker compose up` 验证；第一次起来请先核对
-# GET http://127.0.0.1:7861/health 和日志里的"配置加载完成"路径。
+# 一个容器同时给 API 与前端（镜像里已经打了 dist/，靠 CS_SERVE_FRONTEND=true 挂载），
+# 所以同源、不需要再配 CORS；想分开部署就把它置 false，前端交给任意静态托管。
 #
-# 前端不在这里：`cd src/frontend && npm run build`，把 dist 交给任意静态托管，
-# 由它把 /api 反代到本服务的 7861（和 vite.config.ts 的开发期代理同一口径）。
-# 跨域白名单目前只写了 localhost:8091，改成同源反代即可，不必动后端代码。
+# 多副本：可以 scale，确认表/记忆任务已落库，扫描与出站重试走租约选主（B3-8）。
+# 但每副本各有一份 BM25 缓存、MCP 工具缓存与限流桶——限额要按副本数折算，
+# 且 SQLite 不该作为多副本后端（换成 Postgres/MySQL）。详见 docs/运维手册.md。
+#
+# 密钥一律走环境变量或挂载的 config.local.yaml，绝不写进本文件。
 services:
   cs-agent:
     build:
@@ -17,8 +19,50 @@ services:
     volumes:
       # 数据目录整体挂出来：SQLite、Chroma、上传文件、日志、备份快照都在里面
       - ./src/backend/data:/app/data
-      # 密钥文件只读挂载；CS_CONFIG 是整文件替换，不与服务内 config.simple.yaml 合并
-      - ./src/backend/config.local.yaml:/app/config.local.yaml:ro
+      # 有本地覆盖配置就挂载（:ro）；没有就靠下面的环境变量跑
+      # - ./src/backend/config.local.yaml:/app/config.local.yaml:ro
     environment:
-      CS_CONFIG: /app/config.local.yaml
+      # CS_CONFIG: /app/config.local.yaml
+      CS_SERVER_ENV: production          # 打开生产硬闸：默认密钥/不验签回调会拒绝启动
+      CS_JWT_SECRET: ${CS_JWT_SECRET:?生产必须提供 JWT 密钥（≥32 位随机串）}
+      CS_MODEL_API_KEY: ${CS_MODEL_API_KEY:?必须提供模型 api_key，否则对话与向量化不可用}
+      CS_METRICS_TOKEN: ${CS_METRICS_TOKEN:-}   # 留空则生产不暴露 /metrics
+      CS_PUBLIC_BASE_URL: ${CS_PUBLIC_BASE_URL:-}  # 平台买家点开附件链接的公网地址
+      CS_SERVE_FRONTEND: "true"
+      CS_SERVER_WORKERS: "1"             # SQLite 单写者；换 Postgres 后再考虑加
+      CS_CORS_ORIGINS: ""                # 同源部署：空列表 = 不接受任何跨域
+      TZ: Asia/Shanghai
     restart: unless-stopped
+    # 镜像里 HEALTHCHECK 打的是 /ready（库可查 + 无致命安全项），编排层直接继承
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:7861/ready',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 25s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # 多副本形态：把上面的 SQLite 换成 Postgres，CS_DB_URL 指过来，再 scale cs-agent。
+  # 这一节默认不启用（profiles），要用就 `docker compose --profile postgres up -d`。
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: cs_agent
+      POSTGRES_USER: cs_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?使用 postgres profile 时必须设置}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cs_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:

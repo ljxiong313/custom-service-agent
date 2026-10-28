@@ -1,0 +1,167 @@
+# =============================================================================
+# 生产配置样例（不要直接启用，复制后按环境改）
+# -----------------------------------------------------------------------------
+# 用法：
+#   cp config.production.example.yaml /etc/cs-agent/config.yaml   # 放到仓库外，避免误提交
+#   export CS_CONFIG=/etc/cs-agent/config.yaml
+#   export CS_JWT_SECRET="$(openssl rand -hex 32)"
+#   export CS_MODEL_API_KEY="sk-..."
+#   export CS_PUBLIC_BASE_URL="https://cs.example.com"
+#   python run.py
+#
+# 或者直接用仓库根的 docker-compose.yml，它已经把上面这些环境变量接好了。
+#
+# 三条硬规矩：
+# 1. 密钥一律用 ${ENV} 注入，不写进文件（文件会被备份、会被拷来拷去）；
+# 2. server.env 必须是 production，否则 startup_check 的硬闸全部只是警告
+#    （默认密钥、回调不验签、CORS 通配、内网 MCP 端点、npx 拉包执行都只告警不拦）；
+# 3. 改这份配置前先读 docs/运维手册.md 的 §3 与 §9（回滚）。
+# 与 config.simple.yaml 的差异都写在下面注释里；未列出的键沿用默认值。
+# =============================================================================
+
+server:
+  host: 0.0.0.0
+  port: 7861
+  env: production                    # 生产硬闸总开关
+  public_base_url: ${CS_PUBLIC_BASE_URL}   # 必填：平台买家点开附件链接的公网地址
+  trust_proxy_headers: true          # 前面有反代/LB 且它可靠地写 X-Forwarded-For 才置 true
+  workers: 1                         # SQLite 就保持 1；换 Postgres 后按核数放大
+  serve_frontend: true               # 后端同源托管前端 dist，免第二个静态站点与 CORS
+  frontend_dist: ""                  # 容器里是 /app/web；裸机部署填 npm run build 的 dist 路径
+  cors_origins: []                   # 同源部署：不接受任何跨域
+
+database:
+  # 默认 SQLite（单机小规模够用）。多副本/正式环境请换 Postgres：
+  # url: postgresql+psycopg://cs_agent:pwd@127.0.0.1:5432/cs_agent
+  # url: mysql+pymysql://cs_agent:pwd@127.0.0.1:3306/cs_agent   # 需要自己补 pymysql 依赖
+  url: sqlite:///./data/cs_agent.db
+  migrate_mode: alembic              # 生产走真迁移：漏写迁移会启动失败，而不是被 create_all 悄悄补上
+
+security:
+  jwt_secret: ${CS_JWT_SECRET}       # ≥32 位随机串；留空或默认值在生产直接拒绝启动
+  jwt_algorithm: HS256
+  jwt_expire_minutes: 720            # 生产收窄到 12 小时（默认 7 天太长）
+  media_url_secret: ${CS_MEDIA_URL_SECRET:-}   # 留空复用 jwt_secret
+  media_url_ttl_seconds: 3600        # 附件签名链接 1 小时有效（默认 24 小时偏宽）
+  allow_registration: false          # 关闭自助注册，由 admin 在设置页开账号
+  metrics_token: ${CS_METRICS_TOKEN} # /metrics 的访问令牌；不配则生产 403
+  rate_limit:
+    enabled: true
+    # 阈值是"每进程每键"。多副本要按副本数折算，否则整体放行量翻倍。
+    default: { per_minute: 300, burst: 100 }
+    rules:
+      - path_prefix: /api/v1/auth/login
+        per_minute: 5
+        burst: 5
+      - path_prefix: /api/v1/auth/register
+        per_minute: 3
+        burst: 3
+      - path_prefix: /api/v1/chat
+        per_minute: 30
+        burst: 10
+      - path_prefix: /api/platform
+        per_minute: 600
+        burst: 120
+      - path_prefix: /api/wecom
+        per_minute: 300
+        burst: 60
+
+multi_models:
+  dashscope:
+    api_key: ${CS_MODEL_API_KEY}
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    chat_model: qwen-plus
+    embedding_model: text-embedding-v4
+    rerank_model: gte-rerank-v2
+    rerank_base_url: https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+    vl_model: qwen-vl-plus
+    temperature: 0.3
+  # 备用 provider：主 key 限流/5xx 且还没吐出第一个字时，runner 会换到这一环重跑本轮。
+  # 没有第二家就别配 llm.fallback，配了不存在的名字会在启动/调用时被跳过并告警。
+  # backup:
+  #   api_key: ${CS_BACKUP_API_KEY}
+  #   base_url: https://<另一家兼容 OpenAI 协议的服务>/v1
+  #   chat_model: <模型名>
+default_model: dashscope
+
+llm:
+  request_timeout_seconds: 30        # 客服场景宁可快速失败并降级，也别让买家干等
+  max_retries: 1
+  fallback: []                       # 例如 [backup]
+  # 成本估算价目（元/1000 token）。没配时用量报表显示"未配价"而不是 0 元。
+  pricing:
+    dashscope:
+      qwen-plus: { input_per_1k: 0.0008, output_per_1k: 0.002 }
+      text-embedding-v4: { input_per_1k: 0.0005, output_per_1k: 0 }
+      default: { input_per_1k: 0.001, output_per_1k: 0.002 }
+
+memory:
+  short_max_tokens: 3000
+  long_enabled: true
+
+session:
+  idle_seconds: 300
+  close_after_seconds: 60
+  sweep_interval_seconds: 30
+
+rag:
+  chunk_size: 500
+  chunk_overlap: 100
+  recall_k: 20
+  top_k: 5
+  chroma_path: ""
+  ingest_workers: 2
+  embedding_batch_size: 10           # 上限 20（dashscope 单请求限制）
+  bm25_persist: true                 # 大语料时避免每次检索重建 BM25
+  bm25_index_path: ""                # 留空 = data/bm25/knowledge.pkl
+
+mcp:
+  # 白名单只是第一层：解释器的 -c/-m/-e/--eval 一律拒绝，脚本必须落在
+  # allowed_script_roots 内，生产默认拒绝 npx/uvx/uv（拉包执行 = 任意代码）。
+  allowed_commands: [python, python3]
+  allowed_script_roots: ["./scripts"]
+  allow_package_runners: false
+  allow_private_urls: false
+
+wecom:
+  mock: false                        # 演示完务必关掉，否则转人工卡片只进外发箱
+  corp_id: ${CS_WECOM_CORP_ID}
+  corp_secret: ${CS_WECOM_CORP_SECRET}
+  agent_id: ${CS_WECOM_AGENT_ID}
+  touser: ""
+  callback_token: ${CS_WECOM_CALLBACK_TOKEN}
+  encoding_aes_key: ${CS_WECOM_AES_KEY}
+  workbench_url: ${CS_PUBLIC_BASE_URL}/handoff
+
+# 平台：mock=false 之前必须逐平台按 docs/平台接入.md 核对带 ★ 的方法名与字段名，
+# 并确认 callback_verify 是 sign（配成 none 在生产会直接拒绝启动）。
+# readiness 会把还缺的字段与 needs_review 项列出来：GET /api/v1/platforms/readiness
+platforms:
+  taobao:
+    enabled: false
+    mock: true
+    app_key: ${CS_TAOBAO_APP_KEY}
+    app_secret: ${CS_TAOBAO_APP_SECRET}
+    access_token: ${CS_TAOBAO_ACCESS_TOKEN}
+    callback_verify: sign
+  jd:
+    enabled: false
+    mock: true
+    app_key: ${CS_JD_APP_KEY}
+    app_secret: ${CS_JD_APP_SECRET}
+    access_token: ${CS_JD_ACCESS_TOKEN}
+    callback_verify: sign
+  pdd:
+    enabled: false
+    mock: true
+    app_key: ${CS_PDD_APP_KEY}
+    app_secret: ${CS_PDD_APP_SECRET}
+    access_token: ${CS_PDD_ACCESS_TOKEN}
+    callback_verify: sign
+  douyin:
+    enabled: false
+    mock: true
+    app_key: ${CS_DOUYIN_APP_KEY}
+    app_secret: ${CS_DOUYIN_APP_SECRET}
+    access_token: ${CS_DOUYIN_ACCESS_TOKEN}
+    callback_verify: sign

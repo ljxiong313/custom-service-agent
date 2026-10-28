@@ -1,7 +1,7 @@
 """转人工接口：用户侧触发、客服工作台（看板/工单列表/接单回复/结单）、mock 外发记录。
 
-工作台权限说明：演示阶段任意登录用户可见工单列表（模拟"客服"角色）；
-生产应引入 staff 角色表做 RBAC（见 docs/代码规范.md 的演进备注）。
+工作台权限（B3-6）：工单列表/接单/结单/看板只对 staff+ 开放；普通用户只能拿到
+自己会话的工单。演示阶段"任意登录用户可见工单列表"等于把所有买家的对话摘要外泄。
 """
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlmodel import col, func, select
 
-from app.core.security import CurrentUser, DbSession
-from app.db.models import Conversation, HandoffTicket, Message, User
+from app.core.security import CurrentUser, DbSession, RequireStaff, can_access_conversation, is_staff
+from app.db.models import Conversation, HandoffTicket, Message, User, pk
 from app.services.wecom import client
 from app.services.wecom.handoff import close_ticket, create_ticket, staff_reply
 
@@ -36,7 +36,7 @@ def request_handoff_api(body: RequestBody, user: CurrentUser, session: DbSession
 
 
 @router.post("/tickets")
-def create_ticket_by_operator(body: RequestBody, user: CurrentUser, session: DbSession):
+def create_ticket_by_operator(body: RequestBody, user: RequireStaff, session: DbSession):
     """运营台手动建单：客服对任意渠道会话开单（买家没点确认、但运营判断需要人工时）。
 
     工单归属记会话的真实主人（平台买家是影子用户），企微卡片才显示对的人名。
@@ -52,7 +52,7 @@ def create_ticket_by_operator(body: RequestBody, user: CurrentUser, session: DbS
 
 
 @router.get("/stats")
-def handoff_stats(user: CurrentUser, session: DbSession):
+def handoff_stats(user: RequireStaff, session: DbSession):
     """工作台看板：待接/处理中/今日新建 + 平均首响时长。
 
     首响 = 工单创建 → 该会话第一条**人工**回复（meta.from 为 human_agent 工作台回复
@@ -89,7 +89,12 @@ def handoff_stats(user: CurrentUser, session: DbSession):
 
 @router.get("/tickets")
 def list_tickets(user: CurrentUser, session: DbSession, status_filter: str | None = None):
+    """工单列表：客服及以上全量，普通用户只返回自己会话的工单（工单摘要含买家隐私）。"""
     stmt = select(HandoffTicket).order_by(col(HandoffTicket.id).desc())
+    if not is_staff(user):
+        stmt = stmt.join(Conversation,
+                         col(HandoffTicket.conversation_id) == col(Conversation.id)
+                         ).where(col(Conversation.user_id) == pk(user))
     if status_filter:
         stmt = stmt.where(HandoffTicket.status == status_filter)
     return session.exec(stmt).all()
@@ -99,25 +104,33 @@ class ReplyBody(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
 
 
-@router.post("/tickets/{ticket_id}/reply")
-def reply(ticket_id: int, body: ReplyBody, user: CurrentUser, session: DbSession):
+def _owned_ticket(session, user: User, ticket_id: int) -> HandoffTicket:
     ticket = session.get(HandoffTicket, ticket_id)
-    if not ticket or ticket.status == "closed":
+    if ticket is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "工单不存在或已结单")
+    conv = session.get(Conversation, ticket.conversation_id)
+    if conv is None or not can_access_conversation(user, conv):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "工单不存在或已结单")
+    return ticket
+
+
+@router.post("/tickets/{ticket_id}/reply")
+def reply(ticket_id: int, body: ReplyBody, user: RequireStaff, session: DbSession):
+    ticket = _owned_ticket(session, user, ticket_id)
+    if ticket.status == "closed":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "工单不存在或已结单")
     msg = staff_reply(session, ticket, body.text, staff=user.username)
     return {"message_id": msg.id, "ticket_status": ticket.status}
 
 
 @router.post("/tickets/{ticket_id}/close")
-def close(ticket_id: int, user: CurrentUser, session: DbSession):
-    ticket = session.get(HandoffTicket, ticket_id)
-    if not ticket:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "工单不存在")
+def close(ticket_id: int, user: RequireStaff, session: DbSession):
+    ticket = _owned_ticket(session, user, ticket_id)
     close_ticket(session, ticket)
     return {"ok": True}
 
 
 @router.get("/outbox")
-def outbox(user: CurrentUser, limit: int = 50):
+def outbox(user: RequireStaff, limit: int = 50):
     """企微外发记录（演示转人工提醒送达）；B1-2 起读库，skipped/failed 也留痕。"""
     return client.outbox_records(max(1, min(limit, 200)))

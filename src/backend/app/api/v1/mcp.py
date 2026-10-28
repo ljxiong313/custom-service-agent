@@ -7,8 +7,8 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlmodel import select
 
-from app.core.security import CurrentUser, DbSession, RequireAdmin
-from app.db.models import McpServer
+from app.core.security import CurrentUser, DbSession, RequireAdmin, is_staff
+from app.db.models import Conversation, McpServer, pk
 from app.services.mcp import confirm, manager
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
@@ -25,9 +25,10 @@ class ServerBody(BaseModel):
 
 
 def _validate_command(body: ServerBody) -> None:
-    """白名单校验失败要变成 400 用户可读文案，而不是 500。"""
+    """白名单/参数/端点校验失败要变成 400 用户可读文案，而不是 500。"""
     try:
-        manager.validate_command(body.transport, body.command)
+        manager.validate_command(body.transport, body.command, body.args)
+        manager.validate_url(body.transport, body.url)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
@@ -102,14 +103,23 @@ async def test_server(server_id: int, user: RequireAdmin, session: DbSession):
 
 
 @router.get("/pending")
-def list_pending_confirms(user: CurrentUser):
+def list_pending_confirms(user: CurrentUser, session: DbSession):
     """等待确认的 MCP 工具调用（运营台轮询）。
 
     有确认卡片的会话不只来自网页 SSE：任何渠道都可能排队，所以列表与 /confirm
     分开提供，网页端与运营台都能替会话点确认。
+
+    可见范围（B3-6）：卡片里带着完整工具入参（订单号、买家标识…），所以
+    staff/admin 看全量，普通用户只看自己会话排队的卡片——否则任意买家账号轮询
+    这个接口就能读到别人正在被代点的操作。
     """
     confirm.prune()
-    return {"items": confirm.pending_list()}
+    items = confirm.pending_list()
+    if is_staff(user):
+        return {"items": items}
+    mine = {pk(c) for c in session.exec(
+        select(Conversation).where(Conversation.user_id == pk(user))).all()}
+    return {"items": [i for i in items if i.get("conversation_id") in mine]}
 
 
 class ConfirmBody(BaseModel):
@@ -118,8 +128,15 @@ class ConfirmBody(BaseModel):
 
 
 @router.post("/confirm")
-def resolve_confirm(body: ConfirmBody, user: CurrentUser):
-    ok = confirm.resolve(body.request_id, body.approved)
-    if not ok:
+def resolve_confirm(body: ConfirmBody, user: CurrentUser, session: DbSession):
+    entry = confirm.get(body.request_id)
+    if entry is None:
         raise HTTPException(status.HTTP_410_GONE, "确认请求已过期或不存在")
+    if not is_staff(user):
+        conv = session.get(Conversation, entry.conversation_id)
+        if conv is None or conv.user_id != pk(user):
+            # 归属不符时不区分"不存在"与"无权"，避免用 403 探测他人会话
+            raise HTTPException(status.HTTP_410_GONE, "确认请求已过期或不存在")
+    if not confirm.resolve(body.request_id, body.approved, decided_by=pk(user)):
+        raise HTTPException(status.HTTP_410_GONE, "确认请求已过期或已被处理")
     return {"ok": True}

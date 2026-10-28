@@ -16,8 +16,8 @@ from typing import ClassVar
 from .base import (
     Adapter,
     InboundMessage,
+    allow_none_verify,
     conf,
-    guard_none_verify,
     hmac_sha256_sign,
     http_post_form,
     http_post_json,
@@ -56,8 +56,7 @@ class _TopLike(Adapter):
             return True
         mode = conf(self.name).get("callback_verify", "sign")
         if mode == "none":
-            guard_none_verify(self.name)
-            return True
+            return allow_none_verify(self.name)
         sign = query.get("sign", "")
         secret = conf(self.name).get("app_secret", "")
         params = {k: v for k, v in query.items() if k != "sign"}
@@ -152,8 +151,7 @@ class Douyin(Adapter):
         # 抖店推送验签口径多版本并存：appsecret 拼串 md5 或 header 签名，核对文档后选其一
         c = conf(self.name)
         if c.get("callback_verify", "sign") == "none":
-            guard_none_verify(self.name)
-            return True
+            return allow_none_verify(self.name)
         sign = headers.get("x-doudian-sign") or query.get("sign", "")
         secret = c.get("app_secret", "")
         expect = hmac_sha256_sign(query.get("timestamp", "") + body.decode("utf-8", "ignore"),

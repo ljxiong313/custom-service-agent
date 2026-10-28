@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,10 +19,11 @@ from pathlib import Path
 import httpx
 import yaml
 
-BASE = "http://127.0.0.1:7861/api/v1"
+BASE = f"{os.environ.get('CS_BASE_URL', 'http://127.0.0.1:7861')}/api/v1"
 CASES = Path(__file__).parent / "cases.yaml"
 # 演示语料跟着后端数据目录走，按脚本位置定位——从仓库根还是 src/backend 跑都是同一份文件
 DEMO_DIR = Path(__file__).resolve().parents[1] / "src" / "backend" / "data"
+_CORPUS_MODULE = Path(__file__).resolve().parents[1] / "src" / "backend" / "scripts" / "demo_corpus.py"
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 DEMO_FILES = [("demo_products.xlsx", XLSX), ("demo_policy.txt", "text/plain")]
 
@@ -52,12 +54,32 @@ def login(c: httpx.Client) -> None:
     c.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
 
 
+def _ensure_demo_files() -> None:
+    """演示语料没进 git（data/ 整目录被 gitignore），全新检出时现场补出来。
+
+    生成逻辑在 demo_corpus.py 里（内容按 eval/cases.yaml 的断言倒推），
+    这里只负责把它请进来：缺文件时 smoke 会在"上传演示文件"那步 FileNotFoundError。
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("demo_corpus", _CORPUS_MODULE)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    made = module.ensure_demo_files(DEMO_DIR)
+    if made:
+        print(f"[demo] 演示语料缺失，已现场生成：{', '.join(m.name for m in made)}")
+
+
+
 def ensure_demo_corpus(c: httpx.Client) -> None:
     """演示语料缺失时自动补上传（冒烟脚本会删掉自己上传的副本，评测集不能跟着一起没）。
 
     检索/商品断言全部打在 demo_products.xlsx / demo_policy.txt 上，库里没有它们
     就是环境前置没满足，不该算成质量失败；上传走 admin 接口，非 admin 账号直接跳过。
     """
+    _ensure_demo_files()
     have = {f["name"] for f in c.get(f"{BASE}/knowledge/files").json()}
     missing = [(DEMO_DIR / name, mime) for name, mime in DEMO_FILES if name not in have]
     if not missing:
