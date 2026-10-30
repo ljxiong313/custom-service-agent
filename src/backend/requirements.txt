@@ -15,6 +15,10 @@ sqlmodel>=0.0.22,<0.1
 SQLAlchemy>=2.0,<3.0
 # 生产迁移体系：database.migrate_mode=alembic 时启动要跑 upgrade head，所以是运行依赖不是开发依赖
 alembic>=1.13,<2.0
+# Postgres 驱动：多店/多副本形态下 database.url 是 postgresql+psycopg://…，没装驱动
+# 启动即报 "No module named 'psycopg'"（SQLite 用不到它，但镜像要能跑生产那一档）。
+# 只用 SQLite 且在意体积可以去掉；MySQL 另需 `pymysql>=1.1,<2.0`。
+psycopg[binary]>=3.1,<4.0
 
 # ---- 配置与鉴权 ----
 pyyaml>=6.0,<7.0

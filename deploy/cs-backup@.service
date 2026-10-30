@@ -1,0 +1,47 @@
+# =============================================================================
+# 每店每日快照：一店一次 backup_data.py（数据库 dump + Chroma/上传件/配置归档 + manifest）
+# -----------------------------------------------------------------------------
+#   sudo cp deploy/cs-backup@.service deploy/cs-backup@.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now cs-backup@shop-a.timer
+#   手动跑一次并看输出：sudo systemctl start cs-backup@shop-a.service
+#                journalctl -u cs-backup@shop-a.service -n 50
+#
+# 为什么用仓库里的脚本而不是自己拼 pg_dump + tar：
+#   scripts/backup_data.py 已经处理了三件事——SQLite 走 backup API 折 WAL（手抄 .db+-wal
+#   会拿到时间不对齐的一对文件）、MySQL/PG 的口令不走命令行（ps 能看见）、每份快照配
+#   manifest.json（没有它，"这份备份能不能用"只能等恢复那天现场赌）。
+#   配套的还有 scripts/restore_data.py（默认只校验，动数据要 --yes）与 scripts/verify_restore.py。
+#
+# 恢复演练比备份本身重要：口径与步骤见 docs/运维手册.md §6、§9。
+#
+# 注意 Chroma 是在线拷贝，可能撕裂——可接受，因为 Chunk 表才是唯一真相，
+# 向量随时能用 scripts/reindex_vectors.py 重建。要严格一致就先停该店的实例再跑。
+# =============================================================================
+
+[Unit]
+Description=智能客服 Agent 数据快照（店 %i）
+# 只在盘挂好之后跑；备份目录若在网络盘上，把 network-online.target 也加进 After=
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=csagent
+Group=csagent
+WorkingDirectory=/opt/cs-agent/src/backend
+# 同一份 env / 同一份 YAML：备份用的库、目录、密钥和实例跑的是完全一致的口径，
+# 不然"备份自 A 库、恢复指到 B 库"这种事故只能靠运气发现。
+EnvironmentFile=/etc/cs-agent/shop-%i.env
+Environment=CS_CONFIG=/etc/cs-agent/shop-%i.yaml
+# --out / --keep 来自 env 文件，所以在这里用 shell 展开；路径按店分开，
+# 轮转是"按目录算份数"的，两店共用一个目录会互相删快照。
+ExecStart=/bin/sh -c '/opt/cs-agent/venv/bin/python scripts/backup_data.py --out "${CS_BACKUP_OUT}" --keep "${CS_BACKUP_KEEP}"'
+# 快照目录里是明文密钥（config 一起归档），所以只有属主能读
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/backups/cs-agent
+# 一次全量归档可能要几分钟到几十分钟（取决于上传件体量），别被默认超时掐掉
+TimeoutStartSec=3600

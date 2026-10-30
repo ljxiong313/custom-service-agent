@@ -228,6 +228,13 @@ compose 直接拒绝起容器，而不是起来后裸奔）。想分副本部署
 镜像构建、容器健康检查与端到端冒烟已在 CI 的 `docker` job 里真跑（本机没有 docker，
 所以验证由流水线承担）。多副本与 Postgres 形态见 docs/运维手册.md 第 1、7、8 节。
 
+**多个店同时上线**用 [`deploy/`](deploy/README.md) 那一套，不是根目录这份单店 compose：
+一店一个容器 + 一店一个库 + 一店一套向量目录 + 一店一个域名，共享的只有镜像和反代。
+里面是一店一份的配置模板（`shop.example.yaml` + `env.shop.example`）、多店
+`docker-compose.shop.yml`、带 SSE 关缓冲配置的 `nginx.shop.conf`、裸机用的
+`cs-agent@.service` 与每店快照 `cs-backup@.timer`。为什么必须是多套实例（三条代码依据）
+写在 docs/运维手册.md 第 1.1 节。
+
 ## 已知边界与取舍
 
 - BM25 索引可持久化（`rag.bm25_persist`，默认开），语料涨到十万级仍建议换专职检索引擎；
@@ -237,7 +244,8 @@ compose 直接拒绝起容器，而不是起来后裸奔）。想分副本部署
 - 限流、HTTP 计数、MCP 工具缓存是**每进程**的：多副本时阈值按副本数折算，
   指标由抓取端聚合。
 - RBAC 是 admin/staff/user 三档 + 会话归属过滤，**没有多租户**：知识库、商品表、MCP
-  配置仍是全局共享，一个实例服务多个互不信任的商家需要额外隔离（目前靠部署多套）。
+  配置仍是全局共享，一个实例服务多个互不信任的商家需要额外隔离（目前靠部署多套，
+  形状与依据见 [`deploy/README.md`](deploy/README.md) 与 docs/运维手册.md 第 1.1 节）。
 - 电商四平台的真实出站参数未核对官方文档，默认 mock；平台名下的可配置骨架、
   `needs_review` 标记与就绪自检见 `docs/平台接入.md` 与 `GET /api/v1/platforms/readiness`。
 - 企微真实回调报文未与服务器对过（签名/加解密口径自洽，不是联调结论）。

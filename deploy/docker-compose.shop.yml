@@ -1,0 +1,103 @@
+# =============================================================================
+# 多店部署：一店一个容器 + 一店一个库 + 一店一套向量目录
+# -----------------------------------------------------------------------------
+# 为什么不用 `docker compose up --scale cs-agent=3`：scale 出来的副本共用同一份 CS_DB_NAME 与同一个
+# chroma 目录，那是"同一个店多进程"，不是"多店"。多店之间必须隔离的是**数据**
+# （KnowledgeFile/Product 没有 shop_id，平台 token 按店铺授权），所以这里的形状是
+# 每个店一段独立的 service 定义，而不是一段定义复制 N 份进程。
+# 依据与结论口径见 docs/运维手册.md §1。
+#
+# 用法（在服务器上有 git 仓库 checkout，或至少把 Dockerfile + src/ + deploy/ 拷过去）：
+#   cd /srv/cs-agent
+#   mkdir -p deploy/etc deploy/env deploy/data
+#   cp deploy/shop.example.yaml deploy/etc/shop-a.yaml
+#   cp deploy/env.shop.example  deploy/env/shop-a.env && chmod 600 deploy/env/shop-a.env
+#   vi deploy/etc/shop-a.yaml deploy/env/shop-a.env         # 只改标了「每店不同」的四项
+#   docker compose --env-file deploy/env/postgres.env -f deploy/docker-compose.shop.yml build shop-a
+#   docker compose --env-file deploy/env/postgres.env -f deploy/docker-compose.shop.yml up -d postgres shop-a
+#   curl -fsS localhost:7861/ready        # 200 才算起稳（/ready 会查库 + 确认迁移已跑 + 安全自检无致命项）
+# 加第二个店：解开下面 shop-b 那段注释，改 etc 文件、env 文件、数据目录、宿主端口四处（build 不带）。
+#
+# 密钥不进本文件：全部走 env/shop-*.env（已 gitignore），配置进 etc/shop-*.yaml（同样 gitignore）。
+# 挂载文件必须先用上面的 cp 建出来：宿主机上不存在时 docker 会在那个路径创建一个同名
+# 空目录，然后以"/etc/cs-agent/shop.yaml is a directory"的形式失败——错误离原因很远，别踩。
+# =============================================================================
+
+x-shop-common: &shop-common
+  image: cs-agent:latest        # 各店同镜像：差别只在配置与数据，这样"店 A 能跑店 B 不能跑"才是配置问题
+  # 镜像里 HEALTHCHECK 打的是 /ready（库可查 + 迁移已跑 + 无致命安全项），这里直接继承不再重写
+  restart: unless-stopped
+  environment:
+    CS_CONFIG: /etc/cs-agent/shop.yaml
+    TZ: Asia/Shanghai
+    # 端口在容器里恒为 7861，对外靠 ports 区分；反代按 127.0.0.1:宿主端口 转发
+    CS_SERVER_PORT: "7861"
+    CS_SERVE_FRONTEND: "true"   # 后端同源挂 dist，免第二个静态站点、免 CORS
+    CS_SERVER_WORKERS: "1"      # 每店一进程：限流桶/BM25 缓存/Chroma 句柄都是每进程一份（§8）
+    CS_CORS_ORIGINS: ""         # 同源部署：不接受任何跨域。填 * 在生产直接拒绝启动
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+services:
+  # ---------- 共享的 Postgres：一店一库，不是多店一库 ----------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cs_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?在 deploy/env/postgres.env 或 shell 里先导出，超级用户口令}
+      POSTGRES_DB: cs_agent
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # 只有 pgdata 是空目录时才会执行：首次部署前先把里面的 CREATE DATABASE 改成你的店名
+      - ./postgres.create-dbs.sql:/docker-entrypoint-initdb.d/01-create-dbs.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"   # 只绑回环：库不对外，反代也够不着它
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cs_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # 生产机别让 5432 出现在公网网卡上；上面的 127.0.0.1 绑定是最省事的兜底。
+    shm_size: 256mb
+
+  # ---------- 店 A ----------
+  # 整份文件只有这一段带 build：镜像是共用的，`compose build` 会按 service 各构建一次，
+  # 挂在多个店上就是同一份源码重复构建。加店时复制这一段请把 build 整节删掉。
+  shop-a:
+    <<: *shop-common
+    build:
+      context: ..                 # compose 文件里的相对路径按本文件所在目录解析 → 仓库根
+      dockerfile: Dockerfile
+    # 每店一个数据目录：SQLite 时代它装着库+chroma+上传件，Postgres 之后装着 chroma/bm25/uploads/logs/backups
+    volumes:
+      - ./data/shop-a:/app/data
+      - ./etc/shop-a.yaml:/etc/cs-agent/shop.yaml:ro
+    env_file:
+      - ./env/shop-a.env
+    ports:
+      - "127.0.0.1:7861:7861"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---------- 店 B（模板，默认注释掉）----------
+  # 为什么注释着：compose 对**所有** service 做静态检查，env_file 指向的文件不存在时，
+  # 哪怕你只想 `up -d shop-a` 也会直接报错。所以开新店时整段解开、改四处
+  # （etc 文件名 / env 文件名 / 数据目录 / 宿主端口），build 那节不要带。
+  #
+  # shop-b:
+  #   <<: *shop-common
+  #   volumes:
+  #     - ./data/shop-b:/app/data
+  #     - ./etc/shop-b.yaml:/etc/cs-agent/shop.yaml:ro
+  #   env_file:
+  #     - ./env/shop-b.env
+  #   ports:
+  #     - "127.0.0.1:7862:7861"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+
+volumes:
+  pgdata:

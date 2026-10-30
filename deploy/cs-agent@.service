@@ -1,0 +1,76 @@
+# =============================================================================
+# 裸机（不用 docker）部署时的 systemd 模板单元：一店一个实例
+# -----------------------------------------------------------------------------
+# %i 就是店名，所以文件按店命名，一条命令起一个店：
+#   sudo cp deploy/shop.example.yaml /etc/cs-agent/shop-a.yaml
+#   sudo cp deploy/env.shop.example  /etc/cs-agent/shop-a.env && sudo chmod 600 /etc/cs-agent/shop-a.env
+#   sudo cp deploy/cs-agent@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now cs-agent@shop-a        # 第二个店：cs-agent@shop-b
+#   systemctl status cs-agent@shop-a ; journalctl -u cs-agent@shop-a -f
+#
+# 前置（脚本没法替你做的部分）：
+#   useradd --system --create-home --home-dir /srv/cs-agent --shell /usr/sbin/nologin csagent
+#   mkdir -p /opt/cs-agent && git clone <repo> /opt/cs-agent      # 或解包发布产物
+#   python3.12 -m venv /opt/cs-agent/venv && /opt/cs-agent/venv/bin/pip install -r /opt/cs-agent/src/backend/requirements.txt
+#   cd /opt/cs-agent/src/frontend && npm ci && npm run build       # 产物 dist 给 server.serve_frontend 挂
+#   chown -R csagent:csagent /opt/cs-agent/src/backend/data /srv/cs-agent
+#
+# 为什么一店一个 unit 而不是一个 unit 起多店：进程内的限流桶、BM25 缓存与 Chroma
+# 目录句柄都是"每进程一份"，店与店之间要的是隔离，不是共享同一个解释器。
+# 详见 docs/运维手册.md §1。
+# =============================================================================
+
+[Unit]
+Description=智能客服 Agent（店 %i）
+Documentation=file:///opt/cs-agent/docs/运维手册.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=csagent
+Group=csagent
+WorkingDirectory=/opt/cs-agent/src/backend
+ExecStart=/opt/cs-agent/venv/bin/python run.py
+
+# 配置里全是 ${VAR} 占位符，值必须来自这个 0600 的文件；它同时是备份脚本的取密来源
+EnvironmentFile=/etc/cs-agent/shop-%i.env
+Environment=CS_CONFIG=/etc/cs-agent/shop-%i.yaml
+Environment=PYTHONUNBUFFERED=1
+# 监听端口写在 /etc/cs-agent/shop-%i.env 里（CS_SERVER_PORT），不要在这里写死：
+# 同机跑两个店时它必须不同，而 %i 只能拼文件名、拼不出端口号。
+# 顺带三处要一起改：env 里的端口、YAML 里的 public_base_url、nginx 的 upstream。
+Environment=CS_SERVER_WORKERS=1
+Environment=CS_SERVE_FRONTEND=true
+Environment=CS_CORS_ORIGINS=
+Environment=TZ=Asia/Shanghai
+
+Restart=always
+RestartSec=3
+# 首次启动要跑 alembic 建全表，别让 systemd 在半路把它判成"启动失败"而反复重开
+TimeoutStartSec=180
+TimeoutStopSec=30
+# 停止信号给优雅退出留时间：正在吐字的 SSE 连接会被断开，但排队中的确认表扫描是数据库状态，不丢
+KillSignal=SIGTERM
+
+# ---------- 加固（有意留了几处不做，理由写在旁边） ----------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# 数据、快照、日志写入点按店分目录；换路径就同步改 shop-%i.yaml 里的 rag.chroma_path
+ReadWritePaths=/opt/cs-agent/src/backend/data /var/backups/cs-agent
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# 不设 MemoryDenyWriteExecute / RestrictAddressFamilies：MCP 的 stdio 传输要在本机拉起
+# 子进程（python/node），某些 Python 扩展也会开本地 socket；把它收紧到出问题再收，
+# 不然症状是"MCP 工具莫名起不来"，比少一层加固贵得多。
+# 监听端口 >1024，所以不需要 CAP_NET_BIND_SERVICE：干脆一个能力都不给
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

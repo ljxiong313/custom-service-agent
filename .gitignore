@@ -6,6 +6,15 @@ venv/
 
 # 本地敏感配置（含真实 api_key / jwt_secret），禁止入库
 src/backend/config.local.yaml
+# docker compose 会自动读取项目根的 .env 注入密钥，同样禁止入库
+.env
+.env.*
+!.env.example
+# 多店部署的真实配置、密钥与数据目录：deploy/ 下只允许 *.example 模板入库。
+# （shop-a.env 这类文件名不会被上面的 .env 规则命中，必须按目录挡。）
+deploy/env/
+deploy/etc/
+deploy/data/
 
 # 运行时数据（数据库、日志、上传文件、向量库）
 src/backend/data/

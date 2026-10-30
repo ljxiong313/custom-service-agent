@@ -1,0 +1,280 @@
+# =============================================================================
+# 按店部署的生产配置模板（一店一份）
+# -----------------------------------------------------------------------------
+# 用法（Linux 主机）：
+#   sudo mkdir -p /etc/cs-agent
+#   sudo cp deploy/shop.example.yaml /etc/cs-agent/shop-a.yaml
+#   sudo edit /etc/cs-agent/shop-a.yaml          # 只改下面标了「每店必须不同」的四项
+#   sudo chmod 600 /etc/cs-agent/shop-a.yaml
+#   export CS_CONFIG=/etc/cs-agent/shop-a.yaml
+#
+# 为什么是一店一份、而不是"一套实例接多店"（代码依据）：
+#   1. 平台凭证按 platforms.<name> 整节读取，一个平台只有一个 app_key/access_token
+#      （app/services/platforms/base.py:72），而 TOP session / 京东 access_token 是按店铺
+#      授权的——同平台两店共用一套 token，回复会发错店。
+#   2. KnowledgeFile 与 Product 没有 shop_id 字段（app/db/models.py:108、:137），
+#      知识库与商品表全实例共享：A 店的退货政策会被召回给 B 店的买家。
+#   3. Chroma 是本地目录 + 进程内单句柄（app/services/rag/vectorstore.py:62 用 lru_cache
+#      缓存按路径打开的 PersistentClient），跨进程/跨机共用同一目录属于未验证路径。
+#   详见 docs/运维手册.md §1。
+#
+# 三条硬规矩（和 config.production.example.yaml 一样）：
+#   1. 密钥一律 ${ENV} 注入，不写进文件（文件会被备份、会被拷来拷去）；
+#   2. server.env 必须是 production，否则 startup_check 的硬闸全部只是警告；
+#   3. CS_CONFIG 是**整文件替换**，不与 config.simple.yaml 合并——本文件因此写全了每一节。
+#
+# 每店必须不同的四项：
+#   ① database.url（独立 schema/库）      ② rag.chroma_path + rag.bm25_index_path（独立目录）
+#   ③ server.public_base_url（独立域名）  ④ CS_JWT_SECRET 等平台/模型密钥（每店独立生成，别复用）
+# =============================================================================
+
+server:
+  host: 0.0.0.0
+  # 同机多店时用环境变量 CS_SERVER_PORT 注入不同端口（它会把值转成 int）。
+  # 别在这里写 `${CS_SERVER_PORT:-7861}`：插值出来的是字符串，绕过了那层类型转换。
+  port: 7861
+  env: production                        # 生产硬闸总开关，别留 dev
+  public_base_url: ${CS_PUBLIC_BASE_URL} # 【每店不同】③ 买家点开附件/评价链接的公网地址，末尾不带 /
+  trust_proxy_headers: true              # 仅当反代可靠地写 X-Forwarded-For 时才 true，否则限流可被绕过
+  # workers 同理走 CS_SERVER_WORKERS。这里默认 1，理由不是 Postgres 撑不住，而是两件事：
+  #   1) 限流桶、BM25 缓存、MCP 工具发现缓存都是**每进程一份**，N 个进程等于放行量 ×N；
+  #   2) Chroma 的 PersistentClient 目录句柄在进程内，多进程同开一个 chroma_path 没验证过。
+  # 要横向扩就再起一个"该店的实例"（独立端口 + 独立 chroma_path + nginx 加权），
+  # 而不是把 workers 拉大。阈值口径见 docs/运维手册.md §8。
+  workers: 1
+  serve_frontend: true                   # 后端同源托管 dist，免第二个静态站点与 CORS
+  frontend_dist: ""                      # 容器里是 /app/web；裸机部署填 npm run build 的 dist 路径
+  cors_origins: []                       # 同源部署：不接受任何跨域（含 * 在生产直接拒绝启动）
+
+database:
+  # 【每店不同】① 一店一个库或一个 schema。口令只走环境变量，不上命令行、不进本文件。
+  # 语法说明：本项目的插值只认 `${VAR}` 和 `${VAR:-默认值}`，**不支持** shell 的 `${VAR:?报错文案}`
+  # （写错的后果是这行原样进配置、连不上库还看不出原因）。所以"必填"改用哨兵默认值兜底：
+  # CS_DB_NAME 没配时会去连一个不存在的库，启动直接报错退出，而不是悄悄落到共享库。
+  url: postgresql+psycopg://${CS_DB_USER:-cs_agent}:${CS_DB_PASSWORD}@${CS_DB_HOST:-127.0.0.1}:${CS_DB_PORT:-5432}/${CS_DB_NAME:-SET_CS_DB_NAME_PER_SHOP}
+  # 生产走真迁移：漏写迁移会启动失败，而不是被 create_all 悄悄补上。
+  # 全新空库直接启动即可（baseline 会建表）；只有"以前用 auto 模式跑出来的旧库"才需要先
+  # `alembic stamp 0001` 再 upgrade。
+  migrate_mode: alembic
+
+security:
+  # 【每店不同】④ 每店独立生成、绝不复用：`openssl rand -hex 32`。
+  # 没配时这里是空串，production 下 startup_check 直接拒绝启动（不是警告）。
+  jwt_secret: ${CS_JWT_SECRET}
+  jwt_algorithm: HS256
+  jwt_expire_minutes: 720                # 12 小时；默认 7 天对客服台太长
+  media_url_secret: ${CS_MEDIA_URL_SECRET:-}     # 留空复用 jwt_secret；单独配一个更好（泄漏面不叠加）
+  media_url_ttl_seconds: 3600            # 附件签名链接 1 小时有效
+  feedback_secret: ${CS_FEEDBACK_SECRET:-}       # 满意度回访链接签名密钥；留空回落 jwt_secret
+  allow_registration: false              # 关闭自助注册。空库自举是唯一例外：趁库空注册第一个 admin
+  # /metrics 的访问令牌。留空 = 生产直接 403（这正是默认想要的：不配就不暴露内部指标）。
+  metrics_token: ${CS_METRICS_TOKEN}
+  rate_limit:
+    enabled: true
+    # 阈值是「每进程每键」：workers>1 时整体放行量 ≈ workers × 下面的值，要按进程数折算。
+    # 多店共用一个网关时，把这层当第二道闸，第一道放在 nginx（limit_req）。
+    default: { per_minute: 300, burst: 100 }
+    rules:
+      - path_prefix: /api/v1/auth/login
+        per_minute: 5
+        burst: 5
+      - path_prefix: /api/v1/auth/register
+        per_minute: 3
+        burst: 3
+      - path_prefix: /api/v1/chat
+        per_minute: 30
+        burst: 10
+      - path_prefix: /api/platform       # 平台回调重推很常见，给高一点但要有顶
+        per_minute: 600
+        burst: 120
+      - path_prefix: /api/wecom
+        per_minute: 300
+        burst: 60
+
+# -----------------------------------------------------------------------------
+# 模型：chat / embedding / rerank / vl 是四类独立权限。
+# 上线前用 GET /api/v1/system/status 的 model 节确认四类都 ready——
+# 订阅套餐类 key 常只放行对话模型，embedding 报 403/404 时检索会静默降级 BM25。
+# -----------------------------------------------------------------------------
+multi_models:
+  dashscope:
+    # 没配时对话与向量化都不可用（不报错，是请求时才失败），所以先用
+    # GET /api/v1/system/status 的 model 节确认四类模型都 ready 再放买家进来。
+    api_key: ${CS_MODEL_API_KEY}
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    chat_model: qwen-plus
+    embedding_model: text-embedding-v4
+    rerank_model: gte-rerank-v2
+    rerank_base_url: https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+    vl_model: qwen-vl-plus
+    temperature: 0.3
+  # 备用 provider：多店共用一家供应商时强烈建议配上，否则一家限流所有店同时哑掉。
+  # 名字必须是 multi_models 下的键，配了不存在的名字会跳过并告警。
+  # backup:
+  #   api_key: ${CS_BACKUP_API_KEY}
+  #   base_url: https://<另一家 OpenAI 兼容服务>/v1
+  #   chat_model: <模型名>
+  #   embedding_model: <向量模型名>
+default_model: dashscope
+
+llm:
+  request_timeout_seconds: 30            # 客服场景宁可快速失败并降级，别让买家干等
+  max_retries: 1
+  fallback: []                           # 例如 [backup]
+  # 成本估算价目（元/1000 token），按你的实际合同价填。没配时用量报表显示「未配价」而不是 0 元。
+  pricing:
+    dashscope:
+      qwen-plus: { input_per_1k: 0.0008, output_per_1k: 0.002 }
+      text-embedding-v4: { input_per_1k: 0.0005, output_per_1k: 0 }
+      gte-rerank-v2: { input_per_1k: 0.0008, output_per_1k: 0 }
+      qwen-vl-plus: { input_per_1k: 0.0015, output_per_1k: 0.0045 }
+      default: { input_per_1k: 0.001, output_per_1k: 0.002 }
+
+# -----------------------------------------------------------------------------
+# Agent 人设与转人工口径：换商家只改这里。【多店时这一节通常每店不同】——
+# 店名、禁语、发货口径都不一样，这也是"一店一份配置"的顺带收益。
+# -----------------------------------------------------------------------------
+agent:
+  name: 小 U                             # 换成店铺客服昵称
+  scene: 电商场景的专业在线客服助手
+  tone: 简洁、友好、口语化
+  max_reply_chars: 300
+  language: 中文
+  extra_rules: []
+  # extra_rules: ["禁止承诺具体到货时间", "涉及退款金额必须先复述确认", "本店不支持到付"]
+  # handoff_keywords: "(转人工|人工客服|找个人|真人客服|投诉)"        # 触发"是否转人工"询问
+  # confirm_affirm: "^(嗯+|好(的|呀|啊)?|是(的|呀|吧)?|要(的)?|需要|行|可以|确认|转吧)"
+  # confirm_negate: "^(不|不用|不要|算了|暂时|没|no)"
+  # handoff_ask: "需要我帮你转人工客服吗？"
+  # handoff_queued: "已为你转接人工客服，请稍等～"
+
+memory:
+  short_max_tokens: 3000
+  long_enabled: true                     # 关掉就不做画像抽取，记忆页只剩会话摘要
+
+session:
+  # 满意度回访：开了会在结单告别语后附一条带签名的评价链接（对买家可见，话术要业务方定稿）。
+  # 前提：public_base_url 必须是公网可达地址，否则链接是相对路径、买家点不开。
+  rate_survey_enabled: false
+  rate_survey_days: 7
+  # rate_survey_text: "本次服务还满意吗？点此评价（{url}），1-5 分，10 秒钟就好。"
+  idle_seconds: 300                      # 空闲 5 分钟发"是否结束会话"提示
+  close_after_seconds: 60                # 再 1 分钟无回复自动终结并强关未结工单
+  sweep_interval_seconds: 30
+
+# -----------------------------------------------------------------------------
+# RAG：【每店不同】② chroma_path / bm25_index_path 必须指向该店独立目录，
+# 两店共用一个 chroma 目录 = 向量互相污染 + 写者冲突。
+# -----------------------------------------------------------------------------
+rag:
+  chunk_size: 500
+  chunk_overlap: 100
+  recall_k: 20
+  top_k: 5
+  # 【每店不同】② 目录独立。容器部署时这里是挂载点（每店一个 host 目录挂到 /app/data/…），
+  # 裸机部署就用 CS_CHROMA_PATH / CS_BM25_PATH 指到该店专属目录。
+  chroma_path: ${CS_CHROMA_PATH:-/app/data/chroma}
+  ingest_workers: 2                      # 开太大只是同时打 embedding 限流；大批量重入库放低峰
+  embedding_batch_size: 10               # 硬上限 20（百炼兼容模式），写大了会夹紧并告警
+  bm25_persist: true
+  bm25_index_path: ${CS_BM25_PATH:-/app/data/bm25/knowledge.pkl.gz}
+
+# -----------------------------------------------------------------------------
+# MCP：白名单只是第一层，还会拒绝解释器内联代码（python -c / node -e）与越界脚本路径。
+# 生产默认拒绝 npx/uvx/uv（拉包执行 = 任意代码），内网 sse/http 端点（SSRF 面）。
+# 没有 MCP 需求就把本节整节留着不管即可，管理页不配服务器就不会用到它。
+# -----------------------------------------------------------------------------
+mcp:
+  allowed_commands: [python, python3]
+  allowed_script_roots: ["./scripts"]
+  allow_package_runners: false
+  allow_private_urls: false
+
+# -----------------------------------------------------------------------------
+# 企业微信转人工（不需要电商资质，建议第一批就接通）。
+# 企微后台回调 URL：https://<本店域名>/api/wecom/callback（GET 验证 + POST 收消息）
+# mock 必须改 false，否则转人工卡片只进外发箱、客服永远收不到。
+# -----------------------------------------------------------------------------
+wecom:
+  mock: false
+  corp_id: ${CS_WECOM_CORP_ID}
+  corp_secret: ${CS_WECOM_CORP_SECRET}
+  agent_id: ${CS_WECOM_AGENT_ID}
+  touser: ""                             # 默认接收客服的 userid，@all = 广播给应用可见成员
+  callback_token: ${CS_WECOM_CALLBACK_TOKEN}
+  encoding_aes_key: ${CS_WECOM_AES_KEY}  # 43 位
+  workbench_url: ${CS_PUBLIC_BASE_URL}/handoff
+
+# -----------------------------------------------------------------------------
+# 电商平台（有资质才切真实外呼）。上线顺序不能反：
+#   ① 先 enabled: false 起服务 → ② GET /api/v1/platforms/readiness 核对每平台的
+#      missing_keys 与 ★ needs_review（reply_method / media_method / gateway /
+#      to_uid_field / content_field / ack 结构 / media_url_field）→
+#   ③ 平台后台配回调 URL 并完成 URL 验证 → ④ callback_verify 必须是 sign
+#      （配 none 在生产直接拒绝启动）→ ⑤ 最后才 mock: false，且一次只开一个平台灰度 24h。
+# 这些 ★ 项从未与官方文档核对过，readiness 里的 needs_review 就是留给人工确认的。
+# 【每店不同】④ 每平台的 app_key / app_secret / access_token 都是该店自己的授权。
+# -----------------------------------------------------------------------------
+platforms:
+  retry_interval_seconds: 15             # 出站失败按 15s/60s/240s 三档重投，这里只决定多久查一次队列
+  taobao:
+    enabled: false                       # 灰度：核对完再逐平台改 true
+    mock: true
+    app_key: ${CS_TAOBAO_APP_KEY}
+    app_secret: ${CS_TAOBAO_APP_SECRET}
+    access_token: ${CS_TAOBAO_ACCESS_TOKEN}   # 授权卖家后拿到的 session，按店铺授权
+    session_key: ""                      # 同上，二选一（历史字段名）
+    gateway: "https://gw.api.taobao.com/router/rest"
+    reply_method: ""                     # ★ 客服消息发送 API 方法名
+    callback_verify: "sign"
+    to_uid_field: "to_uid"               # ★
+    content_field: "content"             # ★
+    media_method: ""                     # ★ 留空则买家只收到 [附件] 链接文本
+    media_url_field: "pic_url"           # ★
+    media_type_field: "msg_type"         # ★
+    ack: { code: 0, msg: "success" }     # ★ 回调即时应答体
+  jd:
+    enabled: false
+    mock: true
+    app_key: ${CS_JD_APP_KEY}
+    app_secret: ${CS_JD_APP_SECRET}
+    access_token: ${CS_JD_ACCESS_TOKEN}
+    gateway: "https://api.jd.com/routerjson"
+    reply_method: ""                     # ★
+    callback_verify: "sign"
+    to_uid_field: "to_uid"
+    content_field: "content"
+    media_method: ""                     # ★
+    media_url_field: "pic_url"
+    media_type_field: "msg_type"
+    ack: { code: 0, msg: "success" }
+  pdd:
+    enabled: false
+    mock: true
+    app_key: ${CS_PDD_APP_KEY}           # 拼多多 client_id
+    app_secret: ${CS_PDD_APP_SECRET}
+    access_token: ${CS_PDD_ACCESS_TOKEN}
+    gateway: "https://gateway.pinduoduo.com/api"
+    reply_method: ""                     # ★
+    callback_verify: "sign"
+    to_uid_field: "to_uid"
+    content_field: "content"
+    media_method: ""                     # ★
+    media_url_field: "pic_url"
+    media_type_field: "msg_type"
+    ack: { error: { } }                  # ★ 拼多多要求 {"error":{"code":...}} 结构
+  douyin:
+    enabled: false
+    mock: true
+    app_key: ${CS_DOUYIN_APP_KEY}
+    app_secret: ${CS_DOUYIN_APP_SECRET}  # HMAC-SHA256 签名密钥
+    access_token: ${CS_DOUYIN_ACCESS_TOKEN}   # 店铺授权令牌
+    gateway: "https://openapi.jinritemai.com/"   # ★ 前缀，方法名直接拼接
+    reply_method: ""                     # ★ 飞鸽客服消息发送 API 路径
+    callback_verify: "sign"              # ★ HMAC-SHA256(timestamp + body)，多版本并存
+    to_uid_field: "sender_uid"
+    content_field: "content"
+    media_method: ""                     # ★
+    media_url_field: "pic_url"
+    media_type_field: "msg_type"
+    ack: { code: 0, msg: "success" }

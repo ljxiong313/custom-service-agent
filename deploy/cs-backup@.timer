@@ -1,0 +1,28 @@
+# =============================================================================
+# 快照定时器：每天凌晨跑一次 cs-backup@<店>.service
+# -----------------------------------------------------------------------------
+#   sudo systemctl enable --now cs-backup@shop-a.timer
+#   systemctl list-timers 'cs-backup@*'      # 看下一次什么时候跑
+#   systemctl status cs-backup@shop-a.timer
+#
+# 为什么错开各店时间：同机多店如果都定 03:00，会在那一分钟同时向同一个 Postgres
+# 拉全量 dump，磁盘 IO 尖峰会把当时的对话请求一起拖慢。逐店用 drop-in 改时间：
+#   sudo systemctl edit cs-backup@shop-b.timer   →  [Timer]  OnCalendar=*-*-* 04:20:00
+# =============================================================================
+
+[Unit]
+Description=每日智能客服数据快照（店 %i）
+# 别挂到 multi-user 之外，装了 timer 就自启
+Documentation=file:///opt/cs-agent/docs/运维手册.md
+
+[Timer]
+# 03:15 是低峰；再叠 30 分钟随机抖动，避免多店/多任务撞在同一秒
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=30m
+# 机器当时关着（比如夜间宕机重启）就在开机后补跑一次，而不是整天没备份
+Persistent=true
+AccuracySec=1min
+Unit=cs-backup@%i.service
+
+[Install]
+WantedBy=timers.target
