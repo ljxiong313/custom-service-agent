@@ -23,6 +23,54 @@
 
 ## 快速开始
 
+### 一键演示（30 秒看到满数据的六个界面）
+
+```bash
+cd src/frontend && volta run npm run build      # 只需一次：产出 dist 给后端同源托管
+cd ../backend
+py scripts/seed_demo_data.py --serve           # 灌演示数据 + 起服务，打开 http://127.0.0.1:7866
+```
+
+一条命令做完三件事：在 `src/backend/data/demo/` 里**自造一份隔离配置**（不碰开发者本机的
+`data/cs_agent.db`，该目录已 gitignore）→ 建表并灌入一份像样的一线运营数据 → 同源托管前端 dist。
+**不需要模型 api_key**：没有 embedding key 时语料照灌，检索降级 BM25，界面数据不受影响。
+
+演示账号（密码统一 `Demo@2026`）：
+
+| 账号 | 角色 | 能看到的 |
+|---|---|---|
+| `demo_admin` | 管理员 | 六个界面全开，含运营看板与 MCP 配置 |
+| `demo_staff_wang` | 客服 | 工作台/工单/代答，看不到 MCP 服务器配置入口 |
+| `demo_buyer_chen` | 普通成员 | 只看自己的会话与画像（角色门禁的活样本） |
+
+常用变体：
+
+```bash
+py scripts/seed_demo_data.py --serve --reset        # 清空演示库重来（判定为演示库才允许清）
+py scripts/seed_demo_data.py --serve --port 7870    # 换端口
+py scripts/seed_demo_data.py --rearm                # 截图前重新下发 MCP 确认卡片（TTL 180 秒）
+py scripts/seed_demo_data.py                        # 只灌当前 CS_CONFIG 指向的库，不起服务
+```
+
+脚本在 `server.env=production` 下直接拒绝执行，且默认只往"空库或纯演示库"写
+（`--force-any-db` 才能强行灌进真实库）——`--reset` 是清全表，所以这两道保护是刻意的。
+
+### 界面一览
+
+| 登录（三角色入口） | 会话运营台：客↔我全渠道视图、工具痕迹、引用溯源 |
+|---|---|
+| <img src="screenshots/01-login.png" width="420" alt="登录页"> | <img src="screenshots/02-console-chat.png" width="620" alt="会话运营台"> |
+| **买家视角**：普通成员只看自己的会话，Agent 回复带商品与检索工具徽标 | **知识库 · 文档管理**：切片数/状态/启用开关，下方是重建任务队列（含"已中断"样本） |
+| <img src="screenshots/12-buyer-chat.png" width="420" alt="买家视角会话"> | <img src="screenshots/03-knowledge.png" width="620" alt="知识库文档管理"> |
+| **知识库 · 检索测试**：向量+BM25 混合召回（无 key 时纯 BM25），带命中分块与来源 | **转人工工作台**：工单状态机、首响与处理时长、右侧人工回复面板 |
+| <img src="screenshots/09-knowledge-search.png" width="420" alt="检索测试"> | <img src="screenshots/04-handoff.png" width="620" alt="转人工工作台"> |
+| **转人工 · 外发记录**：企微 textcard 落外发箱，四种渠道来源一眼可辨 | **运营看板**：解决率/转人工率/轮次/关闭率 + 人工侧效率、会话时长、满意度分布、模型用量与成本 |
+| <img src="screenshots/05-handoff-outbox.png" width="420" alt="外发记录"> | <img src="screenshots/06-dashboard.png" width="620" alt="运营看板"> |
+| **记忆 · 长期画像**：对话结束后抽取的稳定事实（偏好/身份/工单结论），可删并同步清向量 | **记忆 · 中期摘要**：短期滑窗之外的历史被滚动压缩成摘要注入系统提示 |
+| <img src="screenshots/10-memory.png" width="420" alt="长期记忆"> | <img src="screenshots/11-memory-summary.png" width="620" alt="中期记忆摘要"> |
+| **MCP**：待确认的工具调用卡片（参数原文 + 同意/拒绝，180 秒超时按拒绝）与服务器列表 | **设置**：成员与角色、服务状态、运行告警、模型用量成本、平台就绪自检 |
+| <img src="screenshots/07-mcp.png" width="420" alt="MCP 待确认卡片"> | <img src="screenshots/08-settings.png" width="620" alt="设置页"> |
+
 ### 后端（端口 7861）
 
 ```bash
@@ -67,11 +115,11 @@ npm run dev
 
 ```bash
 # 离线（不需要后端在跑、不打模型）
-py -m pytest                        # 368 项单测：临时 SQLite + 临时 Chroma，模型 key 留空走降级路径
+py -m pytest                        # 380 项单测：临时 SQLite + 临时 Chroma，模型 key 留空走降级路径
 py -m ruff check src eval           # 120 列，规则 E,F,W,I,B,UP,C4,SIM；刻意不跑 ruff format
 py -m mypy                          # 覆盖 app/ 与 eval/，口径 0 error
 cd src/frontend && volta run npm run typecheck
-cd src/frontend && volta run npm run test        # vitest + jsdom（69+ 项，含 XSS 与角色门禁回归）
+cd src/frontend && volta run npm run test        # vitest + jsdom（72 项，含 XSS 与角色门禁回归）
 
 # 端到端（自动在临时端口拉起隔离实例，跑完自动关掉；不碰本机 data/）
 cd src/backend && py scripts/ci_smoke.py
@@ -108,7 +156,8 @@ CS_CONFIG=config.local.yaml py scripts/verify_restore.py      # Chunk 表 ↔ Ch
 「重新入库」（重跑解析+分块+向量化，failed 文件与 parser 改动后修复都走它）与
 「重建向量」（只补向量，换 embedding 模型后用）三个按钮，任务是后台跑的，页面自动轮询状态。
 
-演示物料：`data/demo_products.xlsx`（4 个 SKU）、`data/demo_policy.txt`（售后政策）、
+演示物料：`py scripts/seed_demo_data.py --serve` 一条命令即可（见上文「一键演示」）；
+它内部用的源文件是 `data/demo_products.xlsx`（4 个 SKU）、`data/demo_policy.txt`（售后政策）、
 `scripts/demo_mcp_server.py`（FastMCP 订单查询服务器，MCP 页可按其命令添加 `demo-order`）。
 平台买家演示（无需资质）：`POST /api/platform/taobao/callback` 发 `{"buyer_id":"b1","shop_id":"s1","text":"…","msg_id":"m1"}`
 → 运营台自动出现「[taobao] b1」会话并展示 Agent 自动回复历史。
